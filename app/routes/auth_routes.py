@@ -3,8 +3,10 @@ from app.core.database import db
 from app.core.security import hash_password, verify_password, create_access_token
 from app.schemas.auth_schema import SignupRequest, LoginRequest, AuthResponse
 from datetime import datetime, timezone
+from app.services.email_service import send_welcome_email
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
+
 
 @router.post("/signup", response_model=AuthResponse)
 async def signup(payload: SignupRequest):
@@ -20,8 +22,19 @@ async def signup(payload: SignupRequest):
         "created_at": now,
         "updated_at": now,
     }
+
     result = await db.users.insert_one(doc)
     user_id = str(result.inserted_id)
+
+    # ✅ Send welcome email (non-blocking for signup success)
+    try:
+        send_welcome_email(
+            to_email=doc["email"],
+            user_name=doc["name"]
+        )
+    except Exception as e:
+        # Do not fail signup if SMTP fails
+        print(f"[auth.signup] Welcome email failed for {doc['email']}: {e}")
 
     token = create_access_token({"sub": user_id, "email": doc["email"], "name": doc["name"]})
     return AuthResponse(
@@ -30,6 +43,7 @@ async def signup(payload: SignupRequest):
         email=doc["email"],
         access_token=token,
     )
+
 
 @router.post("/login", response_model=AuthResponse)
 async def login(payload: LoginRequest):
