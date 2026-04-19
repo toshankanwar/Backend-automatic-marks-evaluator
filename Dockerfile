@@ -25,4 +25,4 @@ COPY . .
 ENV PORT=10000
 
 # Change app.main:app to your actual FastAPI import path
-CMD ["sh", "-c", "gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:$PORT"]
+CMD ["sh", "-c", "gunicorn app.main:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 300 --graceful-timeout 60 --keep-alive 30"]
