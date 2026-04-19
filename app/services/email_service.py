@@ -12,11 +12,7 @@ def _validate_brevo_config() -> bool:
     ])
 
 
-def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
-    """
-    Sends welcome email via Brevo HTTP API.
-    Returns True if sent successfully, else False.
-    """
+def _send_email(to_email: str, subject: str, html: str) -> bool:
     if not _validate_brevo_config():
         print(
             "[email] Brevo config missing. Skipping email send.",
@@ -26,15 +22,44 @@ def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
         )
         return False
 
-    subject = f"Welcome to {settings.APP_NAME} 🚀"
+    payload = {
+        "sender": {
+            "email": settings.EMAIL_FROM,
+            "name": settings.EMAIL_FROM_NAME
+        },
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html
+    }
 
-    html = f"""
+    headers = {
+        "api-key": settings.BREVO_API_KEY,
+        "Content-Type": "application/json",
+        "accept": "application/json",
+    }
+
+    try:
+        res = requests.post(BREVO_API_URL, json=payload, headers=headers, timeout=20)
+        if res.status_code in (200, 201, 202):
+            print(f"[email] Email sent to {to_email} | subject={subject}")
+            return True
+
+        print(f"[email] Brevo send failed: {res.status_code} | {res.text}")
+        return False
+
+    except Exception as e:
+        print(f"[email] Failed to send email to {to_email}: {e}")
+        return False
+
+
+def _base_template(title: str, subtitle: str, body_html: str) -> str:
+    return f"""
     <!DOCTYPE html>
     <html lang="en">
       <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>Welcome to {settings.APP_NAME}</title>
+        <title>{title}</title>
       </head>
       <body style="margin:0; padding:0; background:#f3f4f6; font-family:Arial,Helvetica,sans-serif;">
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f4f6; padding:32px 12px;">
@@ -49,13 +74,13 @@ def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
                       <tr>
                         <td style="padding:28px 28px 22px;">
                           <p style="margin:0; color:#dcfce7; font-size:12px; letter-spacing:1.2px; text-transform:uppercase;">
-                            Welcome aboard
+                            {settings.APP_NAME}
                           </p>
                           <h1 style="margin:8px 0 6px; color:#ffffff; font-size:28px; line-height:1.2;">
-                            {settings.APP_NAME}
+                            {title}
                           </h1>
                           <p style="margin:0; color:#ecfdf5; font-size:14px;">
-                            Your account is live. Let’s do something amazing ✨
+                            {subtitle}
                           </p>
                         </td>
                       </tr>
@@ -66,47 +91,7 @@ def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
                 <!-- Body -->
                 <tr>
                   <td style="padding:30px 28px 10px;">
-                    <h2 style="margin:0 0 10px; font-size:22px; color:#065f46;">
-                      Hi {user_name} 👋
-                    </h2>
-                    <p style="margin:0 0 14px; font-size:15px; line-height:1.7; color:#374151;">
-                      Welcome to <b>{settings.APP_NAME}</b>! Your account has been created successfully.
-                    </p>
-                    <p style="margin:0 0 20px; font-size:15px; line-height:1.7; color:#374151;">
-                      You can now sign in, upload your work, and start using all core features.
-                    </p>
-
-                    <!-- CTA -->
-                    <table role="presentation" cellspacing="0" cellpadding="0" style="margin:0 0 22px;">
-                      <tr>
-                        <td align="center" bgcolor="#059669" style="border-radius:10px;">
-                          <a href="{settings.FRONTEND_URL}" target="_blank"
-                             style="display:inline-block; padding:12px 22px; font-size:14px; font-weight:700; color:#ffffff; text-decoration:none;">
-                            🚀 Get Started
-                          </a>
-                        </td>
-                      </tr>
-                    </table>
-
-                    <!-- Highlights -->
-                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:4px 0 22px; border:1px solid #d1fae5; border-radius:12px; background:#f0fdf4;">
-                      <tr>
-                        <td style="padding:14px 14px 4px; font-size:14px; color:#065f46; font-weight:700;">
-                          What you can do next:
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:0 14px 14px; font-size:14px; color:#166534; line-height:1.8;">
-                          ✅ Upload answer sheets<br/>
-                          ✅ Check OCR extraction accuracy<br/>
-                          ✅ Review scoring insights quickly
-                        </td>
-                      </tr>
-                    </table>
-
-                    <p style="margin:0 0 22px; font-size:12px; color:#6b7280; line-height:1.7;">
-                      If you did not create this account, you can safely ignore this email.
-                    </p>
+                    {body_html}
                   </td>
                 </tr>
 
@@ -131,32 +116,143 @@ def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
     </html>
     """
 
-    payload = {
-        "sender": {
-            "email": settings.EMAIL_FROM,
-            "name": settings.EMAIL_FROM_NAME
-        },
-        "to": [{"email": to_email}],
-        "subject": subject,
-        "htmlContent": html
-    }
 
-    headers = {
-        "api-key": settings.BREVO_API_KEY,
-        "Content-Type": "application/json",
-        "accept": "application/json",
-    }
+def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
+    subject = f"Welcome to {settings.APP_NAME} 🚀"
 
-    try:
-        res = requests.post(BREVO_API_URL, json=payload, headers=headers, timeout=20)
+    body = f"""
+      <h2 style="margin:0 0 10px; font-size:22px; color:#065f46;">
+        Hi {user_name} 👋
+      </h2>
+      <p style="margin:0 0 14px; font-size:15px; line-height:1.7; color:#374151;">
+        Welcome to <b>{settings.APP_NAME}</b>! Your account has been created successfully.
+      </p>
+      <p style="margin:0 0 20px; font-size:15px; line-height:1.7; color:#374151;">
+        You can now sign in, upload your work, and start using all core features.
+      </p>
 
-        if res.status_code in (200, 201, 202):
-            print(f"[email] Welcome email sent to {to_email}")
-            return True
+      <table role="presentation" cellspacing="0" cellpadding="0" style="margin:0 0 22px;">
+        <tr>
+          <td align="center" bgcolor="#059669" style="border-radius:10px;">
+            <a href="{settings.FRONTEND_URL}" target="_blank"
+               style="display:inline-block; padding:12px 22px; font-size:14px; font-weight:700; color:#ffffff; text-decoration:none;">
+              🚀 Get Started
+            </a>
+          </td>
+        </tr>
+      </table>
 
-        print(f"[email] Brevo send failed: {res.status_code} | {res.text}")
-        return False
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:4px 0 22px; border:1px solid #d1fae5; border-radius:12px; background:#f0fdf4;">
+        <tr>
+          <td style="padding:14px 14px 4px; font-size:14px; color:#065f46; font-weight:700;">
+            What you can do next:
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:0 14px 14px; font-size:14px; color:#166534; line-height:1.8;">
+            ✅ Upload answer sheets<br/>
+            ✅ Check OCR extraction accuracy<br/>
+            ✅ Review scoring insights quickly
+          </td>
+        </tr>
+      </table>
 
-    except Exception as e:
-        print(f"[email] Failed to send welcome email to {to_email}: {e}")
-        return False
+      <p style="margin:0 0 22px; font-size:12px; color:#6b7280; line-height:1.7;">
+        If you did not create this account, you can safely ignore this email.
+      </p>
+    """
+
+    html = _base_template(
+        title=f"Welcome to {settings.APP_NAME}",
+        subtitle="Your account is live. Let’s do something amazing ✨",
+        body_html=body,
+    )
+
+    return _send_email(to_email, subject, html)
+
+
+def send_reset_password_email(to_email: str, user_name: str, reset_link: str, expiry_minutes: int = 15) -> bool:
+    subject = f"{settings.APP_NAME} • Reset your password"
+
+    body = f"""
+      <h2 style="margin:0 0 10px; font-size:22px; color:#065f46;">
+        Hi {user_name} 🔐
+      </h2>
+      <p style="margin:0 0 14px; font-size:15px; line-height:1.7; color:#374151;">
+        We received a request to reset your password for <b>{settings.APP_NAME}</b>.
+      </p>
+
+      <table role="presentation" cellspacing="0" cellpadding="0" style="margin:0 0 18px;">
+        <tr>
+          <td align="center" bgcolor="#059669" style="border-radius:10px;">
+            <a href="{reset_link}" target="_blank"
+               style="display:inline-block; padding:12px 22px; font-size:14px; font-weight:700; color:#ffffff; text-decoration:none;">
+              Reset Password
+            </a>
+          </td>
+        </tr>
+      </table>
+
+      <p style="margin:0 0 10px; font-size:13px; color:#6b7280;">
+        This link will expire in <b>{expiry_minutes} minutes</b>.
+      </p>
+      <p style="margin:0 0 22px; font-size:12px; color:#6b7280; line-height:1.7;">
+        If you did not request this, you can ignore this email.
+      </p>
+    """
+
+    html = _base_template(
+        title="Password Reset",
+        subtitle="Secure your account with a new password",
+        body_html=body,
+    )
+
+    return _send_email(to_email, subject, html)
+
+
+def send_password_changed_email(to_email: str, user_name: str = "there") -> bool:
+    subject = f"{settings.APP_NAME} • Password changed"
+
+    body = f"""
+      <h2 style="margin:0 0 10px; font-size:22px; color:#065f46;">
+        Hi {user_name} ✅
+      </h2>
+      <p style="margin:0 0 14px; font-size:15px; line-height:1.7; color:#374151;">
+        Your password was changed successfully.
+      </p>
+      <p style="margin:0 0 22px; font-size:12px; color:#6b7280; line-height:1.7;">
+        If this was not you, please reset your password immediately and contact support.
+      </p>
+    """
+
+    html = _base_template(
+        title="Password Updated",
+        subtitle="Your account security was updated",
+        body_html=body,
+    )
+
+    return _send_email(to_email, subject, html)
+
+
+def send_account_deleted_email(to_email: str, user_name: str = "there") -> bool:
+    subject = f"{settings.APP_NAME} • Account deleted"
+
+    body = f"""
+      <h2 style="margin:0 0 10px; font-size:22px; color:#065f46;">
+        Bye {user_name} 👋
+      </h2>
+      <p style="margin:0 0 14px; font-size:15px; line-height:1.7; color:#374151;">
+        Your account and related data were deleted successfully from <b>{settings.APP_NAME}</b>.
+      </p>
+      <p style="margin:0 0 22px; font-size:12px; color:#6b7280; line-height:1.7;">
+        If this action was not performed by you, contact support immediately.
+      </p>
+    """
+
+    html = _base_template(
+        title="Account Deleted",
+        subtitle="Your data removal request has been completed",
+        body_html=body,
+    )
+
+    return _send_email(to_email, subject, html)
