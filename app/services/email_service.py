@@ -1,33 +1,30 @@
 import os
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import requests
 
-
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp-relay.brevo.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
+EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "")
 APP_NAME = os.getenv("APP_NAME", "AutoGrade")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://autograde.toshankanwar.in")
 
 
-def _validate_smtp_config() -> bool:
-    return all([SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM])
+def _validate_brevo_config() -> bool:
+    return all([BREVO_API_KEY, EMAIL_FROM, EMAIL_FROM_NAME])
 
 
 def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
     """
-    Sends welcome email via Brevo SMTP.
+    Sends welcome email via Brevo HTTP API.
     Returns True if sent successfully, else False.
     """
-    if not _validate_smtp_config():
-        print("[email] SMTP config missing. Skipping email send.")
+    if not _validate_brevo_config():
+        print("[email] Brevo config missing. Skipping email send.")
         return False
 
     subject = f"Welcome to {APP_NAME} 🚀"
 
+    # SAME UI TEMPLATE (unchanged)
     html = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -42,7 +39,6 @@ def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
             <td align="center">
               <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="max-width:640px; background:#ffffff; border-radius:18px; overflow:hidden; border:1px solid #e5e7eb; box-shadow:0 10px 30px rgba(0,0,0,0.08);">
                 
-                <!-- Header -->
                 <tr>
                   <td style="padding:0; background:linear-gradient(135deg,#0ea5e9 0%,#6366f1 50%,#8b5cf6 100%);">
                     <table width="100%" role="presentation" cellspacing="0" cellpadding="0">
@@ -63,7 +59,6 @@ def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
                   </td>
                 </tr>
 
-                <!-- Body -->
                 <tr>
                   <td style="padding:30px 28px 10px;">
                     <h2 style="margin:0 0 10px; font-size:22px; color:#111827;">
@@ -76,7 +71,6 @@ def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
                       You can now sign in, upload your work, and start using all core features.
                     </p>
 
-                    <!-- CTA -->
                     <table role="presentation" cellspacing="0" cellpadding="0" style="margin:0 0 22px;">
                       <tr>
                         <td align="center" bgcolor="#4f46e5" style="border-radius:10px;">
@@ -88,7 +82,6 @@ def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
                       </tr>
                     </table>
 
-                    <!-- Highlights -->
                     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:4px 0 22px; border:1px solid #e5e7eb; border-radius:12px;">
                       <tr>
                         <td style="padding:14px 14px 4px; font-size:14px; color:#111827; font-weight:700;">
@@ -110,7 +103,6 @@ def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
                   </td>
                 </tr>
 
-                <!-- Footer -->
                 <tr>
                   <td style="padding:14px 28px; background:#f9fafb; border-top:1px solid #e5e7eb;">
                     <p style="margin:0; font-size:12px; color:#6b7280;">
@@ -131,19 +123,29 @@ def send_welcome_email(to_email: str, user_name: str = "there") -> bool:
     </html>
     """
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = to_email
-    msg.attach(MIMEText(html, "html"))
+    payload = {
+        "sender": {
+            "email": EMAIL_FROM,
+            "name": EMAIL_FROM_NAME
+        },
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html
+    }
+
+    headers = {
+        "api-key": BREVO_API_KEY,
+        "Content-Type": "application/json",
+        "accept": "application/json",
+    }
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(EMAIL_FROM, [to_email], msg.as_string())
-        print(f"[email] Welcome email sent to {to_email}")
-        return True
+        res = requests.post(BREVO_API_URL, json=payload, headers=headers, timeout=20)
+        if res.status_code in (200, 201, 202):
+            print(f"[email] Welcome email sent to {to_email}")
+            return True
+        print(f"[email] Brevo send failed: {res.status_code} | {res.text}")
+        return False
     except Exception as e:
         print(f"[email] Failed to send welcome email to {to_email}: {e}")
         return False
