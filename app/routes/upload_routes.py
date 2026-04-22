@@ -53,6 +53,10 @@ async def upload_and_evaluate(
         "scoring_ms": 0,
     }
 
+    # NEW: request/evaluation-cycle only embedding cache
+    # Lives only for this API call and reused across all students in this batch.
+    cycle_embedding_cache = {}
+
     # answer key timing
     key_tracker = ProcessTracker(submission_id=f"{evaluation_id}_ANSWER_KEY", student_id="ANSWER_KEY")
     key_tracker.stage_start("upload")
@@ -117,6 +121,7 @@ async def upload_and_evaluate(
                 key_text=key_text,
                 student_text=student_text,
                 tracker=tracker,
+                embedding_cache=cycle_embedding_cache,  # NEW
             )
         except Exception as e:
             tracker.log("PROCESS_FAILED", {"stage": "evaluation", "error": str(e)})
@@ -145,7 +150,8 @@ async def upload_and_evaluate(
 
         print(
             f"[TIMING][{student_id}] upload={upload_ms}ms ocr={ocr_ms}ms "
-            f"parser={parser_ms}ms scoring={scoring_ms}ms total={st_timing.get('total_ms', 0)}ms"
+            f"parser={parser_ms}ms scoring={scoring_ms}ms total={st_timing.get('total_ms', 0)}ms "
+            f"emb_cache_size={len(cycle_embedding_cache)}"
         )
 
         results_summary.append({
@@ -179,12 +185,13 @@ async def upload_and_evaluate(
     )
 
     print("\n========== EVALUATION BATCH TIMING ==========")
-    print(f"Students       : {batch_timing['students_count']}")
-    print(f"Upload Total   : {batch_timing['batch_upload_ms']} ms")
-    print(f"OCR Total      : {batch_timing['batch_ocr_ms']} ms")
-    print(f"Parser Total   : {batch_timing['batch_parser_ms']} ms")
-    print(f"Scoring Total  : {batch_timing['batch_scoring_ms']} ms")
-    print(f"Batch Total    : {batch_timing['batch_total_ms']} ms")
+    print(f"Students         : {batch_timing['students_count']}")
+    print(f"Upload Total     : {batch_timing['batch_upload_ms']} ms")
+    print(f"OCR Total        : {batch_timing['batch_ocr_ms']} ms")
+    print(f"Parser Total     : {batch_timing['batch_parser_ms']} ms")
+    print(f"Scoring Total    : {batch_timing['batch_scoring_ms']} ms")
+    print(f"Batch Total      : {batch_timing['batch_total_ms']} ms")
+    print(f"Embedding Cache  : {len(cycle_embedding_cache)} entries (request-scope)")
     print("=============================================\n")
 
     return {
@@ -192,6 +199,6 @@ async def upload_and_evaluate(
         "inserted": inserted,
         "appended": appended,
         "answer_key_timing": key_timing,
-        "batch_timing": batch_timing,   # NEW
+        "batch_timing": batch_timing,
         "results": results_summary
     }

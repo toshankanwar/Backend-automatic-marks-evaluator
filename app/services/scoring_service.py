@@ -1,5 +1,7 @@
 from sentence_transformers import SentenceTransformer, util
 from app.utils.text_cleaner import tokenize, clean_text
+import hashlib
+from typing import Dict, Optional, Any
 
 _model = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -15,15 +17,15 @@ def _token_set(x: str) -> set:
 def _ngrams(tokens: list, n: int) -> set:
     if len(tokens) < n:
         return set()
-    return set(tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1))
+    return set(tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1))
+
+
+def _emb_key(text: str) -> str:
+    # request-scope key; deterministic in one run
+    return hashlib.sha256(_safe_text(text).encode("utf-8")).hexdigest()
 
 
 def keyword_score(model_ans: str, student_ans: str) -> float:
-    """
-    Stronger than plain intersection:
-    - unigram overlap
-    - bigram overlap (phrase-level)
-    """
     m_clean = _safe_text(model_ans)
     s_clean = _safe_text(student_ans)
 
@@ -42,7 +44,6 @@ def keyword_score(model_ans: str, student_ans: str) -> float:
     s_bi = _ngrams(s_tokens, 2)
     if m_bi:
         bi_overlap = len(m_bi & s_bi) / len(m_bi)
-        # weighted blend: unigram + bigram
         score = 0.7 * uni_overlap + 0.3 * bi_overlap
     else:
         score = uni_overlap
@@ -50,22 +51,38 @@ def keyword_score(model_ans: str, student_ans: str) -> float:
     return max(0.0, min(1.0, score))
 
 
-def semantic_score(model_ans: str, student_ans: str) -> float:
+def semantic_score(
+    model_ans: str,
+    student_ans: str,
+    embedding_cache: Optional[Dict[str, Any]] = None,
+) -> float:
     a = _safe_text(model_ans)
     b = _safe_text(student_ans)
     if not a or not b:
         return 0.0
 
-    emb = _model.encode([a, b], convert_to_tensor=True, normalize_embeddings=True)
-    sim = util.cos_sim(emb[0], emb[1]).item()  # usually in [-1, 1]
+    embedding_cache = embedding_cache if embedding_cache is not None else {}
+
+    key_a = f"model::{_emb_key(a)}"
+    key_b = f"student::{_emb_key(b)}"
+
+    # Cache hits inside single evaluation cycle
+    emb_a = embedding_cache.get(key_a)
+    if emb_a is None:
+        emb_a = _model.encode(a, convert_to_tensor=True, normalize_embeddings=True)
+        embedding_cache[key_a] = emb_a
+
+    emb_b = embedding_cache.get(key_b)
+    if emb_b is None:
+        emb_b = _model.encode(b, convert_to_tensor=True, normalize_embeddings=True)
+        embedding_cache[key_b] = emb_b
+
+    sim = util.cos_sim(emb_a, emb_b).item()  # [-1, 1]
     normalized = (sim + 1.0) / 2.0
     return max(0.0, min(1.0, normalized))
 
 
 def _length_quality_factor(model_ans: str, student_ans: str) -> float:
-    """
-    Penalize very short answers that accidentally score high semantically.
-    """
     m_len = len(tokenize(_safe_text(model_ans)))
     s_len = len(tokenize(_safe_text(student_ans)))
 
@@ -73,7 +90,6 @@ def _length_quality_factor(model_ans: str, student_ans: str) -> float:
         return 0.0
     ratio = s_len / m_len
 
-    # Smooth cap
     if ratio >= 0.85:
         return 1.0
     if ratio >= 0.55:
@@ -85,13 +101,15 @@ def _length_quality_factor(model_ans: str, student_ans: str) -> float:
     return 0.55
 
 
-def evaluate_answer(model_ans: str, student_ans: str, max_marks: float) -> dict:
+def evaluate_answer(
+    model_ans: str,
+    student_ans: str,
+    max_marks: float,
+    embedding_cache: Optional[Dict[str, Any]] = None,  # NEW
+) -> dict:
     k = keyword_score(model_ans, student_ans)
-    s = semantic_score(model_ans, student_ans)
+    s = semantic_score(model_ans, student_ans, embedding_cache=embedding_cache)
 
-    # Dynamic weighting:
-    # short factual answers -> slightly more keyword
-    # long descriptive answers -> more semantic
     m_tokens = tokenize(_safe_text(model_ans))
     if len(m_tokens) <= 25:
         wk, ws = 0.45, 0.55
@@ -100,7 +118,6 @@ def evaluate_answer(model_ans: str, student_ans: str, max_marks: float) -> dict:
 
     base = wk * k + ws * s
 
-    # Length quality factor
     lqf = _length_quality_factor(model_ans, student_ans)
     final = max(0.0, min(1.0, base * lqf))
 

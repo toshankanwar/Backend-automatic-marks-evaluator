@@ -14,14 +14,14 @@ def build_student_result(
     question_schema: list,
     key_text: str,
     student_text: str,
-    tracker: Optional[ProcessTracker] = None,   # NEW
+    tracker: Optional[ProcessTracker] = None,
+    embedding_cache: Optional[Dict[str, Any]] = None,  # NEW
 ):
     tracker = tracker or ProcessTracker(submission_id=evaluation_id, student_id=str(student_id))
-    tracker.log("UPLOAD_COMPLETED")  # if upload step already finished before this call, this still gives timeline continuity
+    tracker.log("UPLOAD_COMPLETED")
 
     expected_q_count = len(question_schema or [])
 
-    # PARSER STAGE
     tracker.stage_start("parser")
     key_map = split_answers_by_question(key_text or "", expected_q_count=expected_q_count)
     stu_map = split_answers_by_question(student_text or "", expected_q_count=expected_q_count)
@@ -31,7 +31,6 @@ def build_student_result(
         "parsed_student_questions": len(stu_map),
     })
 
-    # Validation for partial attempts
     expected_qnos = [int(q["q_no"]) for q in (question_schema or [])]
     attempted_qnos = sorted([q_no for q_no in expected_qnos if (stu_map.get(q_no, "") or "").strip()])
     missing_qnos = [q_no for q_no in expected_qnos if q_no not in attempted_qnos]
@@ -43,7 +42,6 @@ def build_student_result(
             "missing_questions": missing_qnos
         })
 
-    # SCORING STAGE
     tracker.stage_start("scoring")
     q_scores: List[Dict[str, Any]] = []
     total = 0.0
@@ -57,7 +55,6 @@ def build_student_result(
         km = (key_map.get(q_no, "") or "").strip()
         sm = (stu_map.get(q_no, "") or "").strip()
 
-        # More explicit missing handling
         if not sm:
             ev = {
                 "keyword_score": 0.0,
@@ -75,7 +72,12 @@ def build_student_result(
                 "status": "MISSING_KEY_ANSWER"
             }
         else:
-            base = evaluate_answer(km, sm, max_marks)
+            base = evaluate_answer(
+                km,
+                sm,
+                max_marks,
+                embedding_cache=embedding_cache,  # NEW
+            )
             ev = {**base, "status": "EVALUATED"}
 
         row = {
@@ -94,8 +96,6 @@ def build_student_result(
     tracker.stage_end("scoring", {"evaluated_questions": len(q_scores)})
 
     now = datetime.now(timezone.utc)
-
-    # Final timing
     timing = tracker.finalize()
 
     result = {
@@ -109,8 +109,6 @@ def build_student_result(
         "manual_override": False,
         "created_at": now,
         "updated_at": now,
-
-        # NEW: validation summary
         "validation": {
             "expected_questions": expected_q_count,
             "attempted_questions": len(attempted_qnos),
@@ -118,8 +116,6 @@ def build_student_result(
             "status": validation_status,
             "completion_ratio": round((len(attempted_qnos) / expected_q_count), 3) if expected_q_count else 0.0
         },
-
-        # NEW: timing + timeline for frontend
         "timing": timing,
         "timeline": tracker.events,
     }
