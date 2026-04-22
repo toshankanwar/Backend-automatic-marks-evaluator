@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
+from typing import Dict, List, Any, Optional
+
 from app.services.parser_service import split_answers_by_question
 from app.services.scoring_service import evaluate_answer
+from app.utils.process_tracker import ProcessTracker
 
 
 def build_student_result(
@@ -11,13 +14,38 @@ def build_student_result(
     question_schema: list,
     key_text: str,
     student_text: str,
+    tracker: Optional[ProcessTracker] = None,   # NEW
 ):
-    # pass expected question count to parser for better fallback splitting
+    tracker = tracker or ProcessTracker(submission_id=evaluation_id, student_id=str(student_id))
+    tracker.log("UPLOAD_COMPLETED")  # if upload step already finished before this call, this still gives timeline continuity
+
     expected_q_count = len(question_schema or [])
+
+    # PARSER STAGE
+    tracker.stage_start("parser")
     key_map = split_answers_by_question(key_text or "", expected_q_count=expected_q_count)
     stu_map = split_answers_by_question(student_text or "", expected_q_count=expected_q_count)
+    tracker.stage_end("parser", {
+        "expected_questions": expected_q_count,
+        "parsed_key_questions": len(key_map),
+        "parsed_student_questions": len(stu_map),
+    })
 
-    q_scores = []
+    # Validation for partial attempts
+    expected_qnos = [int(q["q_no"]) for q in (question_schema or [])]
+    attempted_qnos = sorted([q_no for q_no in expected_qnos if (stu_map.get(q_no, "") or "").strip()])
+    missing_qnos = [q_no for q_no in expected_qnos if q_no not in attempted_qnos]
+
+    validation_status = "COMPLETE_ATTEMPT" if len(missing_qnos) == 0 else "PARTIAL_ATTEMPT"
+    if validation_status == "PARTIAL_ATTEMPT":
+        tracker.log("VALIDATION_WARNING", {
+            "message": "Some questions were not attempted or not detected.",
+            "missing_questions": missing_qnos
+        })
+
+    # SCORING STAGE
+    tracker.stage_start("scoring")
+    q_scores: List[Dict[str, Any]] = []
     total = 0.0
     total_max = 0.0
 
@@ -29,16 +57,26 @@ def build_student_result(
         km = (key_map.get(q_no, "") or "").strip()
         sm = (stu_map.get(q_no, "") or "").strip()
 
-        # if both missing, give 0 safely
-        if not km and not sm:
+        # More explicit missing handling
+        if not sm:
             ev = {
                 "keyword_score": 0.0,
                 "semantic_score": 0.0,
                 "awarded_marks": 0.0,
-                "feedback": "No answer detected",
+                "feedback": "Not Attempted",
+                "status": "MISSING_STUDENT_ANSWER"
+            }
+        elif not km:
+            ev = {
+                "keyword_score": 0.0,
+                "semantic_score": 0.0,
+                "awarded_marks": 0.0,
+                "feedback": "Answer key missing for this question",
+                "status": "MISSING_KEY_ANSWER"
             }
         else:
-            ev = evaluate_answer(km, sm, max_marks)
+            base = evaluate_answer(km, sm, max_marks)
+            ev = {**base, "status": "EVALUATED"}
 
         row = {
             "q_no": q_no,
@@ -47,13 +85,20 @@ def build_student_result(
             "keyword_score": float(ev["keyword_score"]),
             "semantic_score": float(ev["semantic_score"]),
             "feedback": ev["feedback"],
+            "status": ev["status"],
         }
 
         total += row["awarded_marks"]
         q_scores.append(row)
 
+    tracker.stage_end("scoring", {"evaluated_questions": len(q_scores)})
+
     now = datetime.now(timezone.utc)
-    return {
+
+    # Final timing
+    timing = tracker.finalize()
+
+    result = {
         "user_id": user_id,
         "evaluation_id": evaluation_id,
         "student_id": str(student_id),
@@ -64,4 +109,19 @@ def build_student_result(
         "manual_override": False,
         "created_at": now,
         "updated_at": now,
+
+        # NEW: validation summary
+        "validation": {
+            "expected_questions": expected_q_count,
+            "attempted_questions": len(attempted_qnos),
+            "missing_questions": missing_qnos,
+            "status": validation_status,
+            "completion_ratio": round((len(attempted_qnos) / expected_q_count), 3) if expected_q_count else 0.0
+        },
+
+        # NEW: timing + timeline for frontend
+        "timing": timing,
+        "timeline": tracker.events,
     }
+
+    return result
