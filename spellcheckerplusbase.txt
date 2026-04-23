@@ -1,0 +1,256 @@
+import os
+import re
+import uuid
+import tempfile
+import cv2
+import numpy as np
+import pytesseract
+import pdfplumber
+from fastapi import UploadFile
+from typing import Tuple
+from functools import lru_cache
+import logging
+
+logger = logging.getLogger("ocr_service")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s [OCR] %(levelname)s: %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
+
+# ---------- Configuration ----------
+OCR_LEXICON_PATH = os.environ.get("OCR_LEXICON_PATH", "")  # optional custom words file (one per line)
+_TOKEN_CACHE_SIZE = int(os.environ.get("OCR_TOKEN_CACHE_SIZE", "200000"))
+
+# ---------- SpellChecker (pyspellchecker) ----------
+_SPELL_AVAILABLE = False
+_SPELL = None
+try:
+    from spellchecker import SpellChecker
+    _SPELL_AVAILABLE = True
+except Exception:
+    _SPELL_AVAILABLE = False
+
+def _init_spellchecker():
+    """
+    Initialize pyspellchecker SpellChecker and load custom lexicon if present.
+    """
+    global _SPELL
+    if not _SPELL_AVAILABLE:
+        logger.warning("pyspellchecker not installed; spell postprocessing disabled.")
+        return False
+    if _SPELL is None:
+        try:
+            _SPELL = SpellChecker(language="en")
+            if OCR_LEXICON_PATH and os.path.exists(OCR_LEXICON_PATH):
+                try:
+                    with open(OCR_LEXICON_PATH, "r", encoding="utf-8", errors="ignore") as fh:
+                        words = [ln.strip() for ln in fh if ln.strip()]
+                    if words:
+                        try:
+                            _SPELL.word_frequency.load_words(words)
+                        except Exception:
+                            # fallback: add to SpellChecker by setting known words
+                            for w in words:
+                                _SPELL.word_frequency.add(w)
+                        logger.info("Loaded custom lexicon (%d words) into SpellChecker from %s", len(words), OCR_LEXICON_PATH)
+                except Exception as e:
+                    logger.debug("Failed to load OCR_LEXICON_PATH: %s", e)
+            logger.info("SpellChecker initialized")
+            return True
+        except Exception as e:
+            logger.warning("Failed to initialize SpellChecker: %s", e)
+            _SPELL = None
+            return False
+    return True
+
+@lru_cache(maxsize=_TOKEN_CACHE_SIZE)
+def _cached_spell_correction(token: str) -> str:
+    """
+    Returns corrected lowercase token or original lowercase if no correction.
+    Cached for performance.
+    """
+    if _SPELL is None:
+        return token.lower()
+    core = token.lower()
+    try:
+        if core in _SPELL:
+            return core
+        cand = _SPELL.correction(core)
+        if cand and cand != core:
+            return cand
+    except Exception as e:
+        logger.debug("Spell correction error for '%s': %s", token, e)
+    return core
+
+def _preserve_case(original: str, corrected_lower: str) -> str:
+    if original.isupper():
+        return corrected_lower.upper()
+    if original.istitle():
+        return corrected_lower.capitalize()
+    return corrected_lower
+
+def _is_alpha_token(s: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", s))
+
+def postprocess_text(text: str) -> Tuple[str, int]:
+    """
+    Runs pyspellchecker token-wise corrections on text.
+    Returns (corrected_text, changes_count).
+    Conservative rules:
+      - Only alphabetic tokens (contain letters) are considered
+      - Only tokens length >= 3 are corrected
+      - Preserves original capitalization
+    """
+    if not _SPELL_AVAILABLE:
+        logger.debug("pyspellchecker not available; skipping postprocess_text")
+        return text, 0
+    if _SPELL is None:
+        if not _init_spellchecker():
+            return text, 0
+
+    parts = re.split(r"(\w+['’]?\w+|\w+|[^\w\s])", text, flags=re.UNICODE)
+    changes = 0
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        if re.match(r"^\w+['’]?\w+|\w+$", part):
+            # Skip tokens without letters and very short tokens
+            if not _is_alpha_token(part):
+                continue
+            if len(part) < 3:
+                continue
+            corrected_lower = _cached_spell_correction(part)
+            if corrected_lower is None:
+                continue
+            if corrected_lower != part.lower():
+                parts[i] = _preserve_case(part, corrected_lower)
+                changes += 1
+    corrected_text = "".join(parts)
+    if changes:
+        logger.info("postprocess_text: applied %d spell corrections", changes)
+    return corrected_text, changes
+
+# ---------- OCR helpers ----------
+
+def _clean_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)      # collapse spaces
+    text = re.sub(r"\n{3,}", "\n\n", text)   # collapse extra new lines
+    return text.strip()
+
+def _preprocess_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
+    # grayscale
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # denoise while preserving edges
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+
+    # adaptive threshold (better for uneven lighting)
+    bw = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        15
+    )
+
+    # optional morphology to reduce tiny noise
+    kernel = np.ones((1, 1), np.uint8)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    return bw
+
+def _ocr_tesseract_with_fallbacks(image_bw: np.ndarray) -> str:
+    # Try multiple page segmentation modes, choose best by length
+    configs = [
+        "--oem 3 --psm 6",   # uniform block
+        "--oem 3 --psm 4",   # single column
+        "--oem 3 --psm 11",  # sparse text
+    ]
+
+    best_text = ""
+    for cfg in configs:
+        txt = pytesseract.image_to_string(image_bw, config=cfg) or ""
+        txt = _clean_text(txt)
+        if len(txt) > len(best_text):
+            best_text = txt
+    return best_text
+
+# ---------- High-level API ----------
+
+async def extract_text_from_pdf(file: UploadFile) -> str:
+    """
+    1) Try direct text extraction from PDF.
+    2) If page has no selectable text, convert page to image and OCR it.
+    Then apply pyspellchecker corrections before returning.
+    """
+    # initialize spellchecker once (if available)
+    if _SPELL_AVAILABLE:
+        _init_spellchecker()
+
+    content = await file.read()
+    text_parts = []
+
+    # Cross-platform temp path
+    temp_dir = tempfile.gettempdir()
+    tmp_pdf_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.pdf")
+
+    try:
+        with open(tmp_pdf_path, "wb") as f:
+            f.write(content)
+
+        with pdfplumber.open(tmp_pdf_path) as pdf:
+            for page in pdf.pages:
+                # Direct text first (best for typed PDFs)
+                direct_text = (page.extract_text() or "").strip()
+                if direct_text:
+                    text_parts.append(_clean_text(direct_text))
+                    continue
+
+                # Fallback OCR for scanned PDF pages
+                try:
+                    pil_img = page.to_image(resolution=300).original
+                    page_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                    bw = _preprocess_for_ocr(page_bgr)
+                    ocr_text = _ocr_tesseract_with_fallbacks(bw)
+                    text_parts.append(ocr_text)
+                except Exception as e:
+                    logger.debug("OCR failed on page: %s", e)
+                    text_parts.append("")
+
+        raw = _clean_text("\n\n".join([t for t in text_parts if t]))
+        corrected, changes = postprocess_text(raw)
+        if changes:
+            logger.info("extract_text_from_pdf: spell corrections=%d", changes)
+        return corrected
+
+    finally:
+        try:
+            if os.path.exists(tmp_pdf_path):
+                os.remove(tmp_pdf_path)
+        except Exception:
+            pass
+
+async def extract_text_from_image(file: UploadFile) -> str:
+    # initialize spellchecker once (if available)
+    if _SPELL_AVAILABLE:
+        _init_spellchecker()
+
+    content = await file.read()
+    arr = np.frombuffer(content, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return ""
+
+    bw = _preprocess_for_ocr(img)
+    raw = _ocr_tesseract_with_fallbacks(bw)
+    corrected, changes = postprocess_text(raw)
+    if changes:
+        logger.info("extract_text_from_image: spell corrections=%d", changes)
+    return corrected

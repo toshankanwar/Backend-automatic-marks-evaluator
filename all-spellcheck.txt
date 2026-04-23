@@ -1,0 +1,1166 @@
+"""
+OCR service with improved postprocessing performance.
+
+Key changes for performance:
+- Selective fuzzy correction: only attempt fuzzy matches for tokens that are NOT recognized by
+  combined dictionaries (spellchecker, wordfreq, external dict, custom lexicon) unless
+  OCR_FORCE_CORRECT=1 is set.
+- Use RapidFuzz (if available) for fuzzy matching (much faster than difflib on large lists).
+- LRU cache for per-token fuzzy matches to avoid repeated work.
+- Tunable parameters via environment variables:
+    OCR_EXTERNAL_DICT_PATH (default set to your words_alpha.txt path)
+    OCR_WORDFREQ_TOP_N (default 20000)
+    OCR_USE_RAPIDFUZZ (auto-enabled if rapidfuzz available)
+    OCR_FUZZY_CUTOFF (default 85)
+    OCR_FORCE_CORRECT (default 0)
+"""
+import os
+import re
+import uuid
+import tempfile
+import math
+import io
+import logging
+import subprocess
+import shlex
+from glob import glob
+from typing import List, Tuple, Optional
+from shutil import which
+from functools import lru_cache
+
+import cv2
+import numpy as np
+from PIL import Image
+import pytesseract
+import pdfplumber
+from fastapi import UploadFile
+
+# Optional pdf2image fallback
+try:
+    from pdf2image import convert_from_bytes
+    _PDF2IMAGE_AVAILABLE = True
+except Exception:
+    _PDF2IMAGE_AVAILABLE = False
+
+# Spellchecker (lazy import)
+_SPELL_AVAILABLE = False
+_SPELL = None
+_CUSTOM_LEXICON = set()
+_WORDFREQ_AVAILABLE = False
+_WORDFREQ_LIST: List[str] = []
+_EXTERNAL_DICT_SET = set()
+
+try:
+    from spellchecker import SpellChecker
+    _SPELL_AVAILABLE = True
+except Exception:
+    _SPELL_AVAILABLE = False
+
+# Optional wordfreq for compact English list
+try:
+    from wordfreq import top_n_list
+    _WORDFREQ_AVAILABLE = True
+except Exception:
+    _WORDFREQ_AVAILABLE = False
+
+# Optional RapidFuzz for fast fuzzy matching
+_RAPIDFUZZ_AVAILABLE = False
+try:
+    from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+    _RAPIDFUZZ_AVAILABLE = True
+except Exception:
+    _RAPIDFUZZ_AVAILABLE = False
+
+# Lazy imports for heavy OCR libs (transformers/easyocr)
+_TROCR_AVAILABLE = False
+_EASYOCR_AVAILABLE = False
+_TROCR_MODEL = None
+_TROCR_PROCESSOR = None
+_EASY_OCR_READER = None
+try:
+    import torch
+    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+    _TROCR_AVAILABLE = True
+except Exception:
+    _TROCR_AVAILABLE = False
+
+try:
+    import easyocr
+    _EASYOCR_AVAILABLE = True
+except Exception:
+    _EASYOCR_AVAILABLE = False
+
+# Logging
+logger = logging.getLogger("ocr_service")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [OCR] %(levelname)s: %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# Configuration via environment (with defaults)
+OCR_DEBUG = os.environ.get("OCR_DEBUG", "0").lower() in ("1", "true", "yes")
+OCR_DEBUG_DIR = os.environ.get("OCR_DEBUG_DIR", tempfile.gettempdir())
+OCR_AUTOCORRECT = os.environ.get("OCR_AUTOCORRECT", "1").lower() in ("1", "true", "yes")
+OCR_LEXICON_PATH = os.environ.get("OCR_LEXICON_PATH", "")  # custom domain lexicon
+# Default external dict path (Windows): override with env if needed
+OCR_EXTERNAL_DICT_PATH = os.environ.get(
+    "OCR_EXTERNAL_DICT_PATH",
+    r"C:\Users\tosha\OneDrive\Desktop\major project\backend\words_alpha.txt",
+)
+# Tunables
+OCR_WORDFREQ_TOP_N = int(os.environ.get("OCR_WORDFREQ_TOP_N", "20000"))  # smaller default for speed
+OCR_FUZZY_CUTOFF = int(os.environ.get("OCR_FUZZY_CUTOFF", "85"))  # percent cutoff for fuzzy match
+OCR_FORCE_CORRECT = os.environ.get("OCR_FORCE_CORRECT", "0").lower() in ("1", "true", "yes")
+OCR_USE_RAPIDFUZZ = os.environ.get("OCR_USE_RAPIDFUZZ", "1").lower() in ("1", "true", "yes") and _RAPIDFUZZ_AVAILABLE
+
+# ---------- Basic helpers ----------
+
+
+def _clean_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return text.strip()
+
+
+def _pil_to_cv(img: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+def _cv_to_pil(img_cv: np.ndarray) -> Image.Image:
+    return Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+
+
+def _image_stats(cv_img: np.ndarray) -> dict:
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    mean = float(np.mean(gray))
+    std = float(np.std(gray))
+    minv, maxv = int(np.min(gray)), int(np.max(gray))
+    return {"mean": mean, "std": std, "min": minv, "max": maxv, "shape": cv_img.shape}
+
+
+def _save_debug_image(img_cv: np.ndarray, tag: str):
+    if not OCR_DEBUG:
+        return
+    os.makedirs(OCR_DEBUG_DIR, exist_ok=True)
+    fname = os.path.join(OCR_DEBUG_DIR, f"{tag}_{uuid.uuid4().hex[:8]}.png")
+    try:
+        if img_cv.dtype != np.uint8:
+            img_cv = np.clip(img_cv, 0, 255).astype(np.uint8)
+        cv2.imwrite(fname, img_cv)
+        logger.debug("Saved debug image: %s", fname)
+    except Exception as e:
+        logger.warning("Failed to save debug image %s: %s", fname, e)
+
+
+# ---------- Image processing helpers (unchanged) ----------
+
+def _deskew_image(gray: np.ndarray) -> np.ndarray:
+    coords = np.column_stack(np.where(gray < 255))
+    if coords.shape[0] == 0:
+        return gray
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = 90 + angle
+    if abs(angle) < 0.1:
+        return gray
+    (h, w) = gray.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+
+def _enhance_contrast(gray: np.ndarray) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+
+def _apply_gamma(image: np.ndarray, gamma: float) -> np.ndarray:
+    invGamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(256)]).astype("uint8")
+    return cv2.LUT(image, table)
+
+
+def _background_subtract(gray: np.ndarray, kernel_size: int = 51) -> np.ndarray:
+    try:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        bg = cv2.morphologyEx(gray, cv2.MORPH_OPEN, k)
+        sub = cv2.subtract(gray, bg)
+        sub = cv2.normalize(sub, None, 0, 255, cv2.NORM_MINMAX)
+        return sub
+    except Exception:
+        return gray
+
+
+def _unsharp_mask(gray: np.ndarray, radius=1, amount=1.0) -> np.ndarray:
+    blurred = cv2.GaussianBlur(gray, (0, 0), radius)
+    sharpened = cv2.addWeighted(gray, 1.0 + amount, blurred, -amount, 0)
+    return sharpened
+
+
+def _preprocess_for_ocr(
+    img_bgr: np.ndarray,
+    blocksize=31,
+    c_val=15,
+    do_deskew=True,
+    denoise_h=75,
+    bg_subtract=False,
+    gamma: Optional[float] = None,
+    unsharp=False,
+) -> np.ndarray:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, d=9, sigmaColor=denoise_h, sigmaSpace=denoise_h)
+    if bg_subtract:
+        ksize = max(31, int(min(gray.shape[:2]) / 20) * 2 + 1)
+        try:
+            gray = _background_subtract(gray, kernel_size=ksize)
+        except Exception:
+            pass
+    gray = _enhance_contrast(gray)
+    if gamma is not None and gamma > 0:
+        try:
+            gray = _apply_gamma(gray, gamma)
+        except Exception:
+            pass
+    if unsharp:
+        try:
+            gray = _unsharp_mask(gray, radius=1, amount=1.0)
+        except Exception:
+            pass
+    if do_deskew:
+        gray = _deskew_image(gray)
+    if blocksize % 2 == 0:
+        blocksize += 1
+    blocksize = max(3, min(blocksize, 101))
+    bw = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blocksize,
+        c_val,
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
+    bw = cv2.medianBlur(bw, 3)
+    return bw
+
+
+def _segment_lines_from_bw(bw: np.ndarray, min_height: int = 8) -> List[Tuple[int, int]]:
+    inv = 255 - bw
+    hist = np.sum(inv, axis=1).astype(np.float32)
+    kernel = np.ones(9) / 9.0
+    hist_smooth = np.convolve(hist, kernel, mode="same")
+    maxv = np.max(hist_smooth) if hist_smooth.size else 0.0
+    thresh = max(1.0, maxv * 0.02)
+    lines = []
+    in_line = False
+    start = 0
+    for i, v in enumerate(hist_smooth):
+        if v > thresh and not in_line:
+            in_line = True
+            start = i
+        elif v <= thresh and in_line:
+            end = i
+            in_line = False
+            if (end - start) >= min_height:
+                pad = int((end - start) * 0.12) + 1
+                y1 = max(0, start - pad)
+                y2 = min(bw.shape[0], end + pad)
+                lines.append((y1, y2))
+    if not lines:
+        lines = [(0, bw.shape[0])]
+    return lines
+
+
+# ---------- OCR engine wrappers (unchanged) ----------
+
+def _init_trocr(model_name: str = "microsoft/trocr-small-handwritten"):
+    global _TROCR_MODEL, _TROCR_PROCESSOR, _TROCR_AVAILABLE
+    if not _TROCR_AVAILABLE:
+        return False
+    if _TROCR_MODEL is None:
+        try:
+            _TROCR_MODEL = VisionEncoderDecoderModel.from_pretrained(model_name)
+            _TROCR_PROCESSOR = TrOCRProcessor.from_pretrained(model_name)
+            _TROCR_MODEL.eval()
+            device = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
+            _TROCR_MODEL.to(device)
+            logger.info("TrOCR model loaded (device=%s)", device)
+            return True
+        except Exception as e:
+            logger.warning("Failed to init TrOCR: %s", e)
+            return False
+    return True
+
+
+def _init_easyocr(lang_list: List[str] = ["en"]):
+    global _EASY_OCR_READER, _EASYOCR_AVAILABLE
+    if not _EASYOCR_AVAILABLE:
+        return False
+    if _EASY_OCR_READER is None:
+        try:
+            gpu_flag = False
+            try:
+                import torch as _torchcheck
+                gpu_flag = bool(_torchcheck.cuda.is_available())
+            except Exception:
+                gpu_flag = False
+            _EASY_OCR_READER = easyocr.Reader(lang_list, gpu=gpu_flag)
+            logger.info("EasyOCR reader initialized (gpu=%s)", gpu_flag)
+            return True
+        except Exception as e:
+            logger.warning("Failed to init EasyOCR: %s", e)
+            return False
+    return True
+
+
+def _ocr_trOCR_on_pil(pil_img: Image.Image, model_name: str = "microsoft/trocr-small-handwritten") -> Tuple[str, float]:
+    if not _TROCR_AVAILABLE:
+        return "", 0.0
+    ok = _init_trocr(model_name)
+    if not ok:
+        return "", 0.0
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    w, h = pil_img.size
+    max_w = 1400
+    if w > max_w:
+        scale = max_w / w
+        pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
+    try:
+        pixel_values = _TROCR_PROCESSOR(images=pil_img, return_tensors="pt").pixel_values.to(device)
+        with torch.no_grad():
+            generated_ids = _TROCR_MODEL.generate(pixel_values, max_length=512)
+            pred = _TROCR_PROCESSOR.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    except Exception as e:
+        logger.debug("TrOCR failure: %s", e)
+        return "", 0.0
+    txt = pred.strip()
+    conf = 0.0
+    if txt:
+        printable = sum(1 for c in txt if 32 <= ord(c) <= 126)
+        conf = min(0.99, max(0.2, printable / max(1, len(txt)) * (len(txt) / 40.0)))
+    return txt, float(conf)
+
+
+def _ocr_easyocr_on_pil(pil_img: Image.Image) -> Tuple[str, float]:
+    if not _EASYOCR_AVAILABLE:
+        return "", 0.0
+    ok = _init_easyocr()
+    if not ok:
+        return "", 0.0
+    try:
+        res = _EASY_OCR_READER.readtext(np.array(pil_img))
+        if not res:
+            return "", 0.0
+        texts = [r[1] for r in res]
+        confs = [r[2] for r in res]
+        joined = " ".join(texts).strip()
+        avg_conf = float(sum(confs) / len(confs)) if confs else 0.0
+        return joined, avg_conf
+    except Exception as e:
+        logger.debug("EasyOCR failure: %s", e)
+        return "", 0.0
+
+
+def _ocr_tesseract_on_pil(pil_img: Image.Image) -> Tuple[str, float]:
+    try:
+        img_cv = _pil_to_cv(pil_img)
+        bw = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        configs = [
+            "--oem 3 --psm 6",
+            "--oem 3 --psm 4",
+            "--oem 3 --psm 11",
+        ]
+        best = ""
+        for cfg in configs:
+            txt = pytesseract.image_to_string(bw, config=cfg) or ""
+            txt = _clean_text(txt)
+            if len(txt) > len(best):
+                best = txt
+        conf = 0.5 if best.strip() else 0.0
+        return best.strip(), conf
+    except Exception as e:
+        logger.debug("Tesseract failure: %s", e)
+        return "", 0.0
+
+
+def _ocr_line_with_ensemble(pil_line: Image.Image) -> Tuple[str, float, str]:
+    candidates: List[Tuple[str, float, str]] = []
+    if _TROCR_AVAILABLE:
+        try:
+            txt, conf = _ocr_trOCR_on_pil(pil_line)
+            if txt:
+                candidates.append((txt, conf, "trocr"))
+        except Exception:
+            pass
+    if _EASYOCR_AVAILABLE:
+        try:
+            txt, conf = _ocr_easyocr_on_pil(pil_line)
+            if txt:
+                candidates.append((txt, conf, "easyocr"))
+        except Exception:
+            pass
+    try:
+        txt, conf = _ocr_tesseract_on_pil(pil_line)
+        if txt:
+            candidates.append((txt, conf, "tesseract"))
+    except Exception:
+        pass
+    if not candidates:
+        return "", 0.0, "none"
+    candidates.sort(key=lambda x: (x[1], len(x[0])), reverse=True)
+    best_text, best_conf, engine = candidates[0]
+    best_text = _clean_text(best_text)
+    return best_text, float(best_conf), engine
+
+
+# ---------- Ghostscript / pdf2image raster fallback (unchanged) ----------
+
+def _find_gs_executable() -> Optional[str]:
+    for name in ("gs", "gswin64c", "gswin32c"):
+        p = which(name)
+        if p:
+            return p
+    if os.name == "nt":
+        common_roots = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+                        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")]
+        for root in common_roots:
+            try:
+                gs_root = os.path.join(root, "gs")
+                if os.path.isdir(gs_root):
+                    for entry in os.listdir(gs_root):
+                        candidate = os.path.join(gs_root, entry, "bin", "gswin64c.exe")
+                        if os.path.exists(candidate):
+                            logger.info("Found Ghostscript at common location: %s", candidate)
+                            return candidate
+                        candidate32 = os.path.join(gs_root, entry, "bin", "gswin32c.exe")
+                        if os.path.exists(candidate32):
+                            logger.info("Found Ghostscript at common location: %s", candidate32)
+                            return candidate32
+            except Exception:
+                continue
+    return None
+
+
+def _rasterize_pdf_with_ghostscript(pdf_bytes: bytes, out_dir: str, dpi: int = 600) -> List[str]:
+    gs_exec = _find_gs_executable()
+    if not gs_exec:
+        raise RuntimeError("Ghostscript executable not found on PATH or common locations (gs or gswin64c)")
+    os.makedirs(out_dir, exist_ok=True)
+    tmp_pdf = os.path.join(out_dir, f"raster_in_{uuid.uuid4().hex}.pdf")
+    try:
+        with open(tmp_pdf, "wb") as f:
+            f.write(pdf_bytes)
+        out_pattern = os.path.join(out_dir, "page-%03d.png")
+        cmd = f'"{gs_exec}" -dNOPAUSE -dBATCH -dSAFER -sDEVICE=png16m -r{dpi} -dTextAlphaBits=4 -dGraphicsAlphaBits=4 -sOutputFile={out_pattern} "{tmp_pdf}"'
+        logger.info("Running Ghostscript rasterize: dpi=%d exe=%s", dpi, gs_exec)
+        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        files = sorted(glob(os.path.join(out_dir, "page-*.png")))
+        return files
+    finally:
+        try:
+            if os.path.exists(tmp_pdf):
+                os.remove(tmp_pdf)
+        except Exception:
+            pass
+
+
+async def _raster_pdf_and_ocr_fallback(pdf_bytes: bytes, dpi: int = 600) -> str:
+    tmpdir = tempfile.mkdtemp(prefix="ocr_raster_")
+    png_paths: List[str] = []
+    used_method = None
+    try:
+        try:
+            png_paths = _rasterize_pdf_with_ghostscript(pdf_bytes, tmpdir, dpi=dpi)
+            used_method = "ghostscript"
+            logger.info("Ghostscript produced %d PNGs", len(png_paths))
+        except Exception as e:
+            logger.info("Ghostscript rasterize failed or not available: %s", e)
+            png_paths = []
+
+        if not png_paths and _PDF2IMAGE_AVAILABLE:
+            try:
+                logger.info("Trying pdf2image.convert_from_bytes at dpi=%d", dpi)
+                pages = convert_from_bytes(pdf_bytes, dpi=dpi, fmt="png")
+                for i, p in enumerate(pages, start=1):
+                    ppath = os.path.join(tmpdir, f"page-{i:03d}.png")
+                    p.save(ppath, format="PNG")
+                    png_paths.append(ppath)
+                used_method = "pdf2image"
+                logger.info("pdf2image produced %d PNGs", len(png_paths))
+            except Exception as e:
+                logger.info("pdf2image failed: %s", e)
+
+        if not png_paths:
+            logger.warning("No raster images produced by fallback methods")
+            return ""
+
+        results: List[str] = []
+        for p in png_paths:
+            try:
+                class _DummyUpload:
+                    def __init__(self, path):
+                        self.filename = os.path.basename(path)
+                        self._path = path
+                    async def read(self):
+                        with open(self._path, "rb") as fh:
+                            return fh.read()
+                text = await extract_text_from_image(_DummyUpload(p))
+                if text:
+                    results.append(text)
+            except Exception as e:
+                logger.debug("Failed OCR on raster image %s : %s", p, e)
+                continue
+
+        logger.info("Raster & OCR fallback (%s) produced pages=%d", used_method or "none", len(results))
+        return _clean_text("\n\n".join(results))
+    finally:
+        for f in glob(os.path.join(tmpdir, "*")):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
+
+
+# ---------- Adaptive page processing (fast) ----------
+
+def _process_page_with_adaptive_strategies(page, page_index: int) -> Tuple[str, float]:
+    logger.info("Processing page %d", page_index)
+    try:
+        direct_text = (page.extract_text() or "").strip()
+        if direct_text:
+            logger.info("Page %d: extracted selectable text (len=%d)", page_index, len(direct_text))
+            return _clean_text(direct_text), 0.99
+    except Exception as e:
+        logger.debug("page.extract_text() failed: %s", e)
+
+    dpi_candidates = [300, 400, 600]
+    preprocess_sets = [
+        (31, 15, True, 1.0, False, None, False),
+        (31, 10, True, 1.0, True, None, False),
+        (41, 18, True, 1.0, True, None, True),
+        (31, 15, True, 1.5, False, None, False),
+    ]
+    accept_conf = 0.50
+    best_page_text = ""
+    best_page_conf = 0.0
+    best_strategy = None
+
+    for dpi in dpi_candidates:
+        try:
+            pil_page = page.to_image(resolution=dpi).original.convert("RGB")
+        except Exception as e:
+            logger.debug("Page %d: render at dpi %d failed: %s", page_index, dpi, e)
+            continue
+
+        cv_page = _pil_to_cv(pil_page)
+        stats = _image_stats(cv_page)
+        logger.info("Page %d (dpi=%d) stats mean=%.1f std=%.1f shape=%s", page_index, dpi, stats["mean"], stats["std"], stats["shape"])
+        _save_debug_image(cv_page, f"page{page_index}_dpi{dpi}_raw")
+
+        for (blocksize, c_val, do_deskew, upsample, bg_sub, gamma, us) in preprocess_sets:
+            try:
+                bw = _preprocess_for_ocr(cv_page, blocksize=blocksize, c_val=c_val, do_deskew=do_deskew,
+                                        denoise_h=75, bg_subtract=bg_sub, gamma=gamma, unsharp=us)
+            except Exception as e:
+                logger.debug("Preprocess failed page %d dpi %d: %s", page_index, dpi, e)
+                continue
+
+            _save_debug_image(bw, f"page{page_index}_dpi{dpi}_bs{blocksize}_c{c_val}_bg{bg_sub}_g{gamma}_u{us}")
+
+            try:
+                line_bounds = _segment_lines_from_bw(bw)
+            except Exception as e:
+                logger.debug("Line segmentation failed page %d: %s", page_index, e)
+                line_bounds = [(0, bw.shape[0])]
+
+            page_lines = []
+            line_confs = []
+            line_engines = []
+
+            for (y1, y2) in line_bounds:
+                try:
+                    line_crop_cv = cv_page[y1:y2, :]
+                    if upsample != 1.0:
+                        line_crop_cv = cv2.resize(line_crop_cv, (0, 0), fx=upsample, fy=upsample, interpolation=cv2.INTER_CUBIC)
+                    pil_line = _cv_to_pil(line_crop_cv)
+                except Exception as e:
+                    logger.debug("Line crop error: %s", e)
+                    continue
+
+                txt, conf, engine = _ocr_line_with_ensemble(pil_line)
+                if txt:
+                    page_lines.append(txt)
+                    line_confs.append(conf)
+                    line_engines.append(engine)
+
+            page_conf = float(sum(line_confs) / len(line_confs)) if line_confs else 0.0
+            page_text = "\n".join([t for t in page_lines if t.strip()])
+
+            logger.info("Page %d attempt dpi=%d bs=%d c=%d deskew=%s upsample=%.2f bg=%s g=%s unsharp=%s -> lines=%d conf=%.3f",
+                        page_index, dpi, blocksize, c_val, do_deskew, upsample, bg_sub, gamma, us, len(page_lines), page_conf)
+            if line_engines:
+                from collections import Counter
+                eng_counts = Counter(line_engines)
+                logger.debug("Page %d engine distribution: %s", page_index, dict(eng_counts))
+
+            if page_conf >= accept_conf and page_text:
+                logger.info("Page %d accepted with confidence %.3f using dpi=%d bs=%d c=%d upsample=%.2f", page_index, page_conf, dpi, blocksize, c_val, upsample)
+                return _clean_text(page_text), page_conf
+
+            if page_conf > best_page_conf and page_text:
+                best_page_conf = page_conf
+                best_page_text = page_text
+                best_strategy = (dpi, blocksize, c_val, do_deskew, upsample, bg_sub, gamma, us)
+
+    # cheap invert remediation
+    try:
+        pil_page = page.to_image(resolution=400).original.convert("RGB")
+        cv_page = _pil_to_cv(pil_page)
+        stats = _image_stats(cv_page)
+        mean = stats["mean"]
+        if mean < 100 or mean > 200:
+            logger.info("Page %d attempting invert remediation (mean=%.1f)", page_index, mean)
+            inv = 255 - cv_page
+            _save_debug_image(inv, f"page{page_index}_inverted")
+            bw = _preprocess_for_ocr(inv)
+            line_bounds = _segment_lines_from_bw(bw)
+            page_lines = []
+            page_confs = []
+            for (y1, y2) in line_bounds:
+                try:
+                    pil_line = _cv_to_pil(cv_page[y1:y2, :])
+                    txt, conf, engine = _ocr_line_with_ensemble(pil_line)
+                    if txt:
+                        page_lines.append(txt)
+                        page_confs.append(conf)
+                except Exception:
+                    pass
+            if page_confs:
+                page_conf = float(sum(page_confs) / len(page_confs))
+                page_text = "\n".join(page_lines)
+                logger.info("Page %d invert remediation conf=%.3f", page_index, page_conf)
+                if page_conf > best_page_conf:
+                    best_page_conf = page_conf
+                    best_page_text = page_text
+    except Exception as e:
+        logger.debug("Invert remediation failed page %d: %s", page_index, e)
+
+    # whole-page tesseract.data salvage
+    try:
+        pil_page = page.to_image(resolution=600).original.convert("RGB")
+        img_cv = _pil_to_cv(pil_page)
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config="--psm 1")
+        words = []
+        confs = []
+        for t, c in zip(data.get("text", []), data.get("conf", [])):
+            if t and str(t).strip():
+                words.append(str(t).strip())
+                try:
+                    confs.append(float(c))
+                except Exception:
+                    try:
+                        confs.append(float(c) if c is not None else 0.0)
+                    except Exception:
+                        confs.append(0.0)
+        if words:
+            joined = " ".join(words)
+            avg_conf = float(sum(confs) / len(confs)) if confs else 0.0
+            logger.info("Page %d whole-page tesseract words=%d avg_conf=%.3f", page_index, len(words), avg_conf)
+            if avg_conf >= 15.0 or (avg_conf / 100.0) > best_page_conf:
+                norm_conf = min(0.99, max(0.0, avg_conf / 100.0))
+                return _clean_text(joined), norm_conf
+    except Exception as e:
+        logger.debug("Full-page tesseract-data fallback failed page %d: %s", page_index, e)
+
+    if best_page_text:
+        logger.warning("Page %d returning best candidate with confidence %.3f strategy=%s", page_index, best_page_conf, best_strategy)
+        if OCR_DEBUG and best_page_conf < 0.4:
+            try:
+                _save_debug_image(_pil_to_cv(page.to_image(resolution=600).original.convert("RGB")), f"page{page_index}_lowconf")
+            except Exception:
+                pass
+        return _clean_text(best_page_text), best_page_conf
+
+    logger.warning("Page %d: OCR produced no usable text", page_index)
+    return "", 0.0
+
+
+# ---------- Postprocessing: multi-strategy correction (optimized) ----------
+
+def _load_custom_lexicon(path: str) -> set:
+    words = set()
+    if not path:
+        return words
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                for ln in fh:
+                    w = ln.strip()
+                    if w:
+                        words.add(w.lower())
+            logger.info("Loaded custom lexicon words=%d from %s", len(words), path)
+        else:
+            logger.warning("OCR_LEXICON_PATH provided but file not found: %s", path)
+    except Exception as e:
+        logger.warning("Failed to load lexicon %s: %s", path, e)
+    return words
+
+
+def _load_external_dict(path: str) -> set:
+    s = set()
+    if not path:
+        return s
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                for ln in fh:
+                    w = ln.strip()
+                    if w:
+                        s.add(w.lower())
+            logger.info("Loaded external dict words=%d from %s", len(s), path)
+        else:
+            logger.warning("OCR_EXTERNAL_DICT_PATH not found: %s", path)
+    except Exception as e:
+        logger.warning("Failed to load external dict %s: %s", path, e)
+    return s
+
+
+def _init_spellchecker_and_dicts():
+    """
+    Initialize SpellChecker (if available), wordfreq list, external dict, and custom lexicon.
+    Returns combined_wordset for fast membership tests.
+    """
+    global _SPELL, _CUSTOM_LEXICON, _WORDFREQ_LIST, _WORDFREQ_AVAILABLE, _EXTERNAL_DICT_SET
+
+    # load custom lexicon
+    if OCR_LEXICON_PATH:
+        try:
+            _CUSTOM_LEXICON.update(_load_custom_lexicon(OCR_LEXICON_PATH))
+        except Exception:
+            pass
+
+    # load external dict
+    if OCR_EXTERNAL_DICT_PATH:
+        try:
+            _EXTERNAL_DICT_SET.update(_load_external_dict(OCR_EXTERNAL_DICT_PATH))
+        except Exception:
+            pass
+
+    # init SpellChecker and seed with lexicons + wordfreq top
+    if _SPELL is None and _SPELL_AVAILABLE:
+        try:
+            _SPELL = SpellChecker(language="en")
+            if _CUSTOM_LEXICON:
+                try:
+                    _SPELL.word_frequency.load_words(list(_CUSTOM_LEXICON))
+                except Exception:
+                    pass
+            if _EXTERNAL_DICT_SET:
+                try:
+                    _SPELL.word_frequency.load_words(list(_EXTERNAL_DICT_SET))
+                except Exception:
+                    pass
+            if _WORDFREQ_AVAILABLE:
+                try:
+                    wf = top_n_list("en", n_top=OCR_WORDFREQ_TOP_N)
+                    wf_filtered = [w.lower() for w in wf if re.match(r"^[a-zA-Z'-]+$", w)]
+                    _SPELL.word_frequency.load_words(wf_filtered)
+                    _WORDFREQ_LIST[:] = wf_filtered
+                except Exception as e:
+                    logger.debug("Failed to load wordfreq into SpellChecker: %s", e)
+            logger.info("SpellChecker initialized")
+        except Exception as e:
+            logger.warning("Failed to init SpellChecker: %s", e)
+            _SPELL = None
+
+    # if SpellChecker not available, populate WORDFREQ_LIST for fuzzy fallback
+    if (not _WORDFREQ_LIST) and _WORDFREQ_AVAILABLE:
+        try:
+            wf = top_n_list("en", n_top=OCR_WORDFREQ_TOP_N)
+            _WORDFREQ_LIST[:] = [w.lower() for w in wf if re.match(r"^[a-zA-Z'-]+$", w)]
+            if _CUSTOM_LEXICON:
+                _WORDFREQ_LIST = list(dict.fromkeys(list(_CUSTOM_LEXICON) + _WORDFREQ_LIST))
+            logger.info("Loaded WORDFREQ_LIST size=%d", len(_WORDFREQ_LIST))
+        except Exception as e:
+            logger.info("Failed to load wordfreq list: %s", e)
+
+    # if external dict not loaded, try again
+    if OCR_EXTERNAL_DICT_PATH and not _EXTERNAL_DICT_SET:
+        _EXTERNAL_DICT_SET.update(_load_external_dict(OCR_EXTERNAL_DICT_PATH))
+
+    # build combined set for quick membership checks
+    combined = set()
+    if _CUSTOM_LEXICON:
+        combined.update(_CUSTOM_LEXICON)
+    if _WORDFREQ_LIST:
+        combined.update(_WORDFREQ_LIST)
+    if _EXTERNAL_DICT_SET:
+        combined.update(_EXTERNAL_DICT_SET)
+    logger.info("Postprocess resources ready: spell=%s, wordfreq=%s (N=%d), external=%s, combined_words=%d, rapidfuzz=%s",
+                bool(_SPELL), bool(_WORDFREQ_LIST), len(_WORDFREQ_LIST), bool(_EXTERNAL_DICT_SET), len(combined), _RAPIDFUZZ_AVAILABLE)
+    return combined
+
+
+def _tokenize_preserve(text: str) -> List[str]:
+    return re.split(r"(\w+['’]?\w+|\w+|[^\w\s])", text, flags=re.UNICODE)
+
+
+def _is_numeric(token: str) -> bool:
+    return bool(re.fullmatch(r"[\d\.,%]+", token))
+
+
+# Cached fuzzy match helper (per token+source)
+@lru_cache(maxsize=200000)
+def _fuzzy_match_cached(token: str, source_key: str, cutoff: int) -> Optional[str]:
+    core = token.lower()
+    if source_key == "wordfreq":
+        pool = _WORDFREQ_LIST
+    elif source_key == "external":
+        pool = sorted(_EXTERNAL_DICT_SET)
+    else:
+        pool = []
+    if not pool:
+        return None
+    try:
+        if OCR_USE_RAPIDFUZZ and _RAPIDFUZZ_AVAILABLE:
+            # rapidfuzz returns (match, score, idx)
+            res = rf_process.extractOne(core, pool, scorer=rf_fuzz.ratio, score_cutoff=cutoff)
+            if res:
+                # res[0] is match
+                return res[0]
+            return None
+        else:
+            # difflib fallback
+            matches = difflib.get_close_matches(core, pool, n=1, cutoff=cutoff / 100.0)
+            return matches[0] if matches else None
+    except Exception as e:
+        logger.debug("Fuzzy match error token=%s source=%s: %s", token, source_key, e)
+        return None
+
+
+def _should_attempt_correction(token: str, combined_wordset: set) -> bool:
+    if OCR_FORCE_CORRECT:
+        return True
+    if not token or not re.search(r"[A-Za-z]", token):
+        return False
+    core = token.lower()
+    if core in combined_wordset:
+        return False
+    if _SPELL is not None:
+        try:
+            if core in _SPELL:
+                return False
+        except Exception:
+            pass
+    if _is_numeric(core):
+        return False
+    if len(core) < 3:
+        return False
+    return True
+
+
+def _apply_fuzzy_correction_once(token: str, combined_wordset: set, cutoff: int) -> str:
+    """
+    Try fuzzy correction using multiple sources (wordfreq then external).
+    Returns corrected token or original.
+    """
+    if not _should_attempt_correction(token, combined_wordset):
+        return token
+    core = token.lower()
+    # try spellchecker first if available
+    if _SPELL is not None:
+        try:
+            cand = _SPELL.correction(core)
+            if cand and cand != core:
+                if token.isupper():
+                    return cand.upper()
+                if token.istitle():
+                    return cand.capitalize()
+                return cand
+        except Exception:
+            pass
+    # try wordfreq fuzzy
+    if _WORDFREQ_LIST:
+        m = _fuzzy_match_cached(core, "wordfreq", cutoff)
+        if m and m != core:
+            if token.isupper():
+                return m.upper()
+            if token.istitle():
+                return m.capitalize()
+            return m
+    # try external dict fuzzy
+    if _EXTERNAL_DICT_SET:
+        m = _fuzzy_match_cached(core, "external", cutoff)
+        if m and m != core:
+            if token.isupper():
+                return m.upper()
+            if token.istitle():
+                return m.capitalize()
+            return m
+    return token
+
+
+def _apply_tokenwise_fuzzy(text: str, combined_wordset: set, cutoff: int) -> str:
+    parts = _tokenize_preserve(text)
+    for i, p in enumerate(parts):
+        if re.match(r"^\w+['’]?\w+|\w+$", p or ""):
+            corrected = _apply_fuzzy_correction_once(p, combined_wordset, cutoff)
+            if corrected != p:
+                parts[i] = corrected
+    return "".join(parts)
+
+
+def _run_all_strategies_and_pick_best(text: str) -> Tuple[str, str]:
+    """
+    Run strategies with optimized behavior:
+    - baseline original
+    - tokenwise fuzzy (selective) using spellchecker/wordfreq/external
+    - if OCR_FORCE_CORRECT, run full-token-fuzzy for more aggressive correction
+    Choose best by fraction of recognized words.
+    """
+    combined_wordset = _init_spellchecker_and_dicts()
+    candidates = []
+
+    # baseline
+    base_score = _score_by_dictionary(text, combined_wordset)
+    candidates.append(("original", text, base_score))
+
+    # Selective fuzzy correction (fast)
+    try:
+        sel_text = _apply_tokenwise_fuzzy(text, combined_wordset, OCR_FUZZY_CUTOFF)
+        sel_score = _score_by_dictionary(sel_text, combined_wordset)
+        candidates.append(("selective_fuzzy", sel_text, sel_score))
+    except Exception as e:
+        logger.debug("Selective fuzzy failed: %s", e)
+
+    # If force-correct or user wants full correction, run more aggressive pass
+    if OCR_FORCE_CORRECT:
+        try:
+            full_text = _apply_tokenwise_fuzzy(text, set(), OCR_FUZZY_CUTOFF)  # no combined set => tries all
+            full_score = _score_by_dictionary(full_text, combined_wordset)
+            candidates.append(("full_fuzzy", full_text, full_score))
+        except Exception as e:
+            logger.debug("Full fuzzy failed: %s", e)
+
+    # Evaluate best by fraction of english tokens
+    best = None
+    best_ratio = -1.0
+    priority_map = {"full_fuzzy": 3, "selective_fuzzy": 2, "original": 1}
+    for name, txt, (n_eng, total) in candidates:
+        ratio = (n_eng / total) if total > 0 else 0.0
+        priority = priority_map.get(name, 0)
+        if ratio > best_ratio or (abs(ratio - best_ratio) < 1e-9 and priority > (priority_map.get(best[0]) if best else 0)):
+            best = (name, txt, (n_eng, total))
+            best_ratio = ratio
+
+    if best is None:
+        return text, "original"
+    chosen_name, chosen_text, (n_eng, total) = best
+    logger.info("Postprocess chosen=%s english=%d/%d ratio=%.3f", chosen_name, n_eng, total, (n_eng/total if total else 0.0))
+    return chosen_text, chosen_name
+
+
+def _score_by_dictionary(corrected_text: str, combined_wordset: set) -> Tuple[int, int]:
+    parts = re.findall(r"\w+['’]?\w+|\w+", corrected_text, flags=re.UNICODE)
+    if not parts:
+        return 0, 0
+    n_eng = 0
+    for token in parts:
+        tk = token.lower()
+        if _is_numeric(tk):
+            n_eng += 1
+            continue
+        if tk in combined_wordset:
+            n_eng += 1
+            continue
+        if _SPELL is not None:
+            try:
+                if tk in _SPELL:
+                    n_eng += 1
+                    continue
+            except Exception:
+                pass
+    return n_eng, len(parts)
+
+
+def postprocess_text(text: str) -> Tuple[str, int]:
+    corrected_text, strategy = _run_all_strategies_and_pick_best(text)
+    changes = 0
+    if corrected_text != text:
+        orig_parts = re.findall(r"\w+['’]?\w+|\w+", text, flags=re.UNICODE)
+        corr_parts = re.findall(r"\w+['’]?\w+|\w+", corrected_text, flags=re.UNICODE)
+        for a, b in zip(orig_parts, corr_parts):
+            if a != b:
+                changes += 1
+        changes += abs(len(orig_parts) - len(corr_parts))
+    if changes:
+        logger.info("Postprocess applied strategy=%s changes=%d", strategy, changes)
+    else:
+        logger.debug("Postprocess: no changes (strategy=%s)", strategy)
+    return corrected_text, changes
+
+
+# ---------- High-level API (always apply postprocess) ----------
+
+async def extract_text_from_pdf(file: UploadFile) -> str:
+    _init_spellchecker_and_dicts()
+    logger.info("extract_text_from_pdf called filename=%s", getattr(file, "filename", "<in-memory>"))
+    content = await file.read()
+    text_parts: List[str] = []
+
+    temp_dir = tempfile.gettempdir()
+    tmp_pdf_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.pdf")
+    try:
+        with open(tmp_pdf_path, "wb") as f:
+            f.write(content)
+
+        with pdfplumber.open(tmp_pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            logger.info("PDF loaded pages=%d", total_pages)
+            failed_pages = 0
+            for idx, page in enumerate(pdf.pages, start=1):
+                page_text, page_conf = _process_page_with_adaptive_strategies(page, idx)
+                if page_text:
+                    logger.info("Page %d final text len=%d conf=%.3f", idx, len(page_text), page_conf)
+                    text_parts.append(page_text)
+                else:
+                    logger.warning("Page %d empty after OCR", idx)
+                    failed_pages += 1
+
+        final = _clean_text("\n\n".join(text_parts))
+        logger.info("PDF OCR overall extracted_chars=%d failed_pages=%d", len(final), failed_pages)
+
+        # Always postprocess and return chosen corrected text
+        corrected, changes = postprocess_text(final)
+        if changes:
+            logger.info("extract_text_from_pdf: applied autocorrect changes=%d", changes)
+        if corrected:
+            return corrected
+
+        # Fallback to raster if empty
+        logger.info("Primary OCR empty after postprocess; running raster fallback")
+        fallback_text = await _raster_pdf_and_ocr_fallback(content, dpi=600)
+        fallback_text = _clean_text(fallback_text)
+        corrected_fb, changes_fb = postprocess_text(fallback_text)
+        if changes_fb:
+            logger.info("extract_text_from_pdf (fallback): applied autocorrect changes=%d", changes_fb)
+        return corrected_fb
+    finally:
+        try:
+            if os.path.exists(tmp_pdf_path):
+                os.remove(tmp_pdf_path)
+        except Exception:
+            pass
+
+
+async def extract_text_from_image(file: UploadFile) -> str:
+    _init_spellchecker_and_dicts()
+    logger.info("extract_text_from_image called filename=%s", getattr(file, "filename", "<in-memory>"))
+    content = await file.read()
+    try:
+        pil = Image.open(io.BytesIO(content)).convert("RGB")
+    except Exception as e:
+        logger.warning("Failed to open image: %s", e)
+        return ""
+
+    cv_img = _pil_to_cv(pil)
+    stats = _image_stats(cv_img)
+    logger.info("Image stats mean=%.1f std=%.1f shape=%s", stats["mean"], stats["std"], stats["shape"])
+    _save_debug_image(cv_img, "image_raw")
+
+    preprocess_sets = [
+        (31, 15, True, 1.0, False, None, False),
+        (31, 12, True, 1.0, False, None, False),
+        (41, 18, True, 1.2, True, None, True),
+        (31, 15, False, 1.5, True, 0.9, True),
+    ]
+
+    best_text = ""
+    best_conf = 0.0
+
+    for (bs, c_val, deskew, upsample, bg_sub, gamma, unsharp) in preprocess_sets:
+        try:
+            bw = _preprocess_for_ocr(cv_img, blocksize=bs, c_val=c_val, do_deskew=deskew, bg_subtract=bg_sub, gamma=gamma, unsharp=unsharp)
+            _save_debug_image(bw, f"image_pre_bs{bs}_c{c_val}_deskew{deskew}_bg{bg_sub}_g{gamma}_u{unsharp}")
+            line_bounds = _segment_lines_from_bw(bw)
+        except Exception as e:
+            logger.debug("Image preprocess/segment failed: %s", e)
+            line_bounds = [(0, cv_img.shape[0])]
+
+        lines = []
+        confs = []
+        engines = []
+        for (y1, y2) in line_bounds:
+            line_cv = cv_img[y1:y2, :]
+            if upsample != 1.0:
+                line_cv = cv2.resize(line_cv, (0, 0), fx=upsample, fy=upsample, interpolation=cv2.INTER_CUBIC)
+            pil_line = _cv_to_pil(line_cv)
+            txt, conf, engine = _ocr_line_with_ensemble(pil_line)
+            if txt:
+                lines.append(txt)
+                confs.append(conf)
+                engines.append(engine)
+
+        page_text = "\n".join(lines).strip()
+        page_conf = float(sum(confs) / len(confs)) if confs else 0.0
+        logger.info("Image attempt bs=%d c=%d deskew=%s upsample=%.2f bg=%s g=%s u=%s lines=%d conf=%.3f",
+                    bs, c_val, deskew, upsample, bg_sub, gamma, unsharp, len(lines), page_conf)
+        if page_conf > best_conf and page_text:
+            best_conf = page_conf
+            best_text = page_text
+        if page_conf >= 0.5:
+            logger.info("Image accepted with conf %.3f", page_conf)
+            corrected, changes = postprocess_text(page_text)
+            if changes:
+                logger.info("extract_text_from_image: applied autocorrect changes=%d", changes)
+            return _clean_text(corrected)
+
+    # full-image ensemble fallback
+    try:
+        txts = []
+        confs = []
+        if _TROCR_AVAILABLE:
+            t, c = _ocr_trOCR_on_pil(pil)
+            if t:
+                txts.append(t); confs.append(c)
+        if _EASYOCR_AVAILABLE:
+            t, c = _ocr_easyocr_on_pil(pil)
+            if t:
+                txts.append(t); confs.append(c)
+        t, c = _ocr_tesseract_on_pil(pil)
+        if t:
+            txts.append(t); confs.append(c)
+        if confs:
+            avg = float(sum(confs) / len(confs))
+            joined = "\n".join([t for t in txts if t.strip()])
+            logger.info("Image full-ensemble conf=%.3f", avg)
+            if avg > best_conf and joined.strip():
+                best_conf = avg
+                best_text = joined
+    except Exception as e:
+        logger.debug("Full image fallback failed: %s", e)
+
+    if best_text:
+        corrected, changes = postprocess_text(best_text)
+        if changes:
+            logger.info("extract_text_from_image: applied autocorrect changes=%d", changes)
+        if OCR_DEBUG and best_conf < 0.4:
+            _save_debug_image(cv_img, "image_lowconf")
+        return _clean_text(corrected)
+
+    logger.warning("Image OCR produced no usable text")
+    corrected, changes = postprocess_text("")
+    return _clean_text(corrected)
