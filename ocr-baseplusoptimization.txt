@@ -1,0 +1,486 @@
+import os
+import re
+import uuid
+import tempfile
+import cv2
+import numpy as np
+import pytesseract
+import pdfplumber
+from fastapi import UploadFile
+from typing import List, Tuple, Optional
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+
+# Optional libs
+try:
+    import easyocr
+    _EASY_OCR_AVAILABLE = True
+except Exception:
+    _EASY_OCR_AVAILABLE = False
+
+_RAPIDFUZZ_AVAILABLE = False
+try:
+    from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+    _RAPIDFUZZ_AVAILABLE = True
+except Exception:
+    _RAPIDFUZZ_AVAILABLE = False
+    import difflib
+
+# Logging
+logger = logging.getLogger("ocr_service")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s [OCR] %(levelname)s: %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
+
+# ---------- Configuration (tweak via env vars) ----------
+OCR_ACCEPT_CONF = float(os.environ.get("OCR_ACCEPT_CONF", "0.60"))  # page-level early accept threshold (0-1)
+OCR_MAX_WORKERS = int(os.environ.get("OCR_MAX_WORKERS", str(max(1, (os.cpu_count() or 2) - 1))))
+OCR_EXTERNAL_DICT_PATH = os.environ.get(
+    "OCR_EXTERNAL_DICT_PATH",
+    r"C:\Users\tosha\OneDrive\Desktop\major project\backend\words_alpha.txt",
+)
+OCR_USE_CORPUS_CORRECTION = os.environ.get("OCR_USE_CORPUS_CORRECTION", "1").lower() in ("1", "true", "yes")
+OCR_FUZZY_CUTOFF = int(os.environ.get("OCR_FUZZY_CUTOFF", "85"))  # 0-100 for rapidfuzz or difflib cutoff
+OCR_TOKEN_CACHE_SIZE = int(os.environ.get("OCR_TOKEN_CACHE_SIZE", "200000"))
+
+# ---------- Utility helpers ----------
+
+def _clean_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)      # collapse spaces
+    text = re.sub(r"\n{3,}", "\n\n", text)   # collapse extra new lines
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return text.strip()
+
+def _pil_to_bgr(pil_img):
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+# ---------- Preprocessing helpers ----------
+
+def _preprocess_for_ocr(img_bgr: np.ndarray, blocksize=31, c_val=15, upsample=1.0) -> np.ndarray:
+    # Resize if needed
+    if upsample != 1.0:
+        img_bgr = cv2.resize(img_bgr, (0, 0), fx=upsample, fy=upsample, interpolation=cv2.INTER_CUBIC)
+
+    # grayscale
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # denoise while preserving edges
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+
+    # optional CLAHE to boost contrast
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    # adaptive threshold (better for uneven lighting)
+    if blocksize % 2 == 0:
+        blocksize += 1
+    bw = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blocksize,
+        c_val
+    )
+
+    # morphology to reduce tiny noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    return bw
+
+# ---------- OCR engines & fallbacks ----------
+
+def _ocr_tesseract_with_fallbacks(image_bw: np.ndarray) -> Tuple[str, float]:
+    """
+    Return (best_text, avg_conf_0_1) from multiple psm attempts.
+    avg_conf returned in 0..1 range (0 when no words).
+    """
+    configs = [
+        "--oem 3 --psm 6",   # uniform block
+        "--oem 3 --psm 4",   # single column
+        "--oem 3 --psm 11",  # sparse text
+    ]
+
+    best_text = ""
+    best_conf = 0.0
+    for cfg in configs:
+        try:
+            data = pytesseract.image_to_data(image_bw, output_type=pytesseract.Output.DICT, config=cfg)
+            words = data.get("text", [])
+            confs = data.get("conf", [])
+            text = " ".join([w for w in words if w and str(w).strip()])
+            text = _clean_text(text)
+            # compute average confidence ignoring '-1' which indicates not available
+            numeric_confs = []
+            for c in confs:
+                try:
+                    val = float(c)
+                    if val >= 0:
+                        numeric_confs.append(val)
+                except Exception:
+                    pass
+            avg_conf = (sum(numeric_confs) / len(numeric_confs) / 100.0) if numeric_confs else 0.0
+            if len(text) > len(best_text) or (len(text) == len(best_text) and avg_conf > best_conf):
+                best_text = text
+                best_conf = avg_conf
+        except Exception as e:
+            logger.debug("Tesseract attempt failed: %s", e)
+            continue
+    return best_text, float(best_conf)
+
+def _ocr_easyocr_on_bgr(img_bgr: np.ndarray) -> Tuple[str, float]:
+    if not _EASY_OCR_AVAILABLE:
+        return "", 0.0
+    try:
+        reader = easyocr.Reader(["en"], gpu=False)  # small, lazy reader; to speed up you can cache a global reader
+    except Exception as e:
+        logger.debug("easyocr init failed: %s", e)
+        return "", 0.0
+    try:
+        res = reader.readtext(img_bgr)
+        if not res:
+            return "", 0.0
+        texts = [r[1] for r in res if r and len(r) >= 2]
+        confidences = [r[2] for r in res if r and len(r) >= 3]
+        text = " ".join(texts).strip()
+        avg = float(sum(confidences) / len(confidences)) / 1.0 if confidences else 0.0
+        # easyocr confidences are 0..1
+        return _clean_text(text), float(avg)
+    except Exception as e:
+        logger.debug("easyocr read failed: %s", e)
+        return "", 0.0
+
+# ---------- Line segmentation (helps accuracy) ----------
+
+def _segment_lines_from_bw(bw: np.ndarray, min_height: int = 8) -> List[Tuple[int, int]]:
+    inv = 255 - bw
+    hist = np.sum(inv, axis=1).astype(np.float32)
+    kernel = np.ones(9)/9.0
+    hist_smooth = np.convolve(hist, kernel, mode="same")
+    maxv = np.max(hist_smooth) if hist_smooth.size else 0.0
+    thresh = max(1.0, maxv * 0.02)
+    lines = []
+    in_line = False
+    start = 0
+    for i, v in enumerate(hist_smooth):
+        if v > thresh and not in_line:
+            in_line = True
+            start = i
+        elif v <= thresh and in_line:
+            end = i
+            in_line = False
+            if (end - start) >= min_height:
+                pad = int((end - start) * 0.08) + 1
+                y1 = max(0, start - pad)
+                y2 = min(bw.shape[0], end + pad)
+                lines.append((y1, y2))
+    if not lines:
+        lines = [(0, bw.shape[0])]
+    return lines
+
+# ---------- External corpus membership & fuzzy correction ----------
+
+def _load_external_corpus(path: str) -> set:
+    s = set()
+    if not path:
+        return s
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                for ln in fh:
+                    w = ln.strip()
+                    if w:
+                        s.add(w.lower())
+            logger.info("Loaded external corpus size=%d from %s", len(s), path)
+        else:
+            logger.warning("External corpus file not found: %s", path)
+    except Exception as e:
+        logger.warning("Failed to load external corpus %s: %s", path, e)
+    return s
+
+_EXTERNAL_CORPUS: Optional[set] = None
+
+def _ensure_corpus():
+    global _EXTERNAL_CORPUS
+    if _EXTERNAL_CORPUS is None:
+        _EXTERNAL_CORPUS = _load_external_corpus(OCR_EXTERNAL_DICT_PATH)
+
+@lru_cache(maxsize=OCR_TOKEN_CACHE_SIZE)
+def _fuzzy_match_token(token: str, cutoff: int) -> Optional[Tuple[str, float]]:
+    core = token.lower()
+    if not core:
+        return None
+    if not _EXTERNAL_CORPUS:
+        return None
+    pool = sorted(_EXTERNAL_CORPUS)
+    try:
+        if _RAPIDFUZZ_AVAILABLE:
+            res = rf_process.extractOne(core, pool, scorer=rf_fuzz.ratio, score_cutoff=cutoff)
+            if res:
+                match = res[0]
+                score = float(res[1])
+                return match, score
+            return None
+        else:
+            matches = difflib.get_close_matches(core, pool, n=1, cutoff=cutoff/100.0)
+            if matches:
+                return matches[0], 100.0
+            return None
+    except Exception as e:
+        logger.debug("Fuzzy match error: %s", e)
+        return None
+
+def _preserve_case(orig: str, repl: str) -> str:
+    if orig.isupper():
+        return repl.upper()
+    if orig.istitle():
+        return repl.capitalize()
+    return repl
+
+def _is_numeric_token(s: str) -> bool:
+    return bool(re.fullmatch(r"[\d\.,%]+", s))
+
+def postprocess_with_corpus(text: str) -> Tuple[str, int]:
+    """
+    Conservative corrections:
+      - Only alphabetic tokens >= 3 chars considered
+      - If token exists in corpus, keep it
+      - Else fuzzy-match against corpus and replace if score >= cutoff
+    """
+    if not OCR_USE_CORPUS_CORRECTION:
+        return text, 0
+    _ensure_corpus()
+    if not _EXTERNAL_CORPUS:
+        return text, 0
+
+    parts = re.split(r"(\w+['’]?\w+|\w+|[^\w\s])", text, flags=re.UNICODE)
+    changes = 0
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        if re.match(r"^\w+['’]?\w+|\w+$", part):
+            if _is_numeric_token(part):
+                continue
+            core = part.lower()
+            if len(core) <= 2:
+                continue
+            if core in _EXTERNAL_CORPUS:
+                continue
+            # fuzzy match
+            matched = _fuzzy_match_token(core, OCR_FUZZY_CUTOFF)
+            if matched:
+                match_word, score = matched
+                if score >= OCR_FUZZY_CUTOFF and match_word != core:
+                    parts[i] = _preserve_case(part, match_word)
+                    changes += 1
+    corrected = "".join(parts)
+    if changes:
+        logger.info("postprocess_with_corpus: applied %d corrections", changes)
+    return corrected, changes
+
+# ---------- Heuristic handwriting detector ----------
+
+def _detect_handwritten(img_bgr: np.ndarray) -> bool:
+    """
+    Lightweight heuristic to guess if image is handwritten:
+    - compute variance of stroke width proxy: Laplacian variance and edge density
+    - handwriting often has higher local curvature and variable stroke width compared to printed text
+    This is a heuristic and not perfect; it's cheap to compute.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    # edge density
+    edges = cv2.Canny(gray, 50, 150)
+    edge_density = np.mean(edges > 0)
+    # Laplacian variance (focus measure)
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    lap_var = float(np.var(lap))
+    # stroke thickness proxy: use morphological open/close difference
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+    diff = np.mean(np.abs(gray.astype(np.int16) - opened.astype(np.int16)))
+    # combine heuristics
+    # These thresholds were chosen conservatively; tune if needed
+    if edge_density > 0.015 and lap_var < 150.0 and diff > 6.0:
+        logger.debug("Handwriting heuristic: edge_density=%.4f lap_var=%.1f diff=%.1f => handwritten",
+                     edge_density, lap_var, diff)
+        return True
+    return False
+
+# ---------- Per-page processing pipeline ----------
+
+def _process_image_page(img_bgr: np.ndarray, page_index: int) -> Tuple[str, float]:
+    """
+    Process a single rendered page image and return (text, avg_conf).
+    avg_conf is 0..1; text is cleaned string.
+    """
+    # Quick Tesseract pass (fast)
+    try:
+        quick_text, quick_conf = _ocr_tesseract_with_fallbacks(img_bgr)
+        if quick_text and quick_conf >= OCR_ACCEPT_CONF:
+            logger.info("Page quick-accept idx=%d conf=%.3f len=%d", page_index, quick_conf, len(quick_text))
+            return quick_text, quick_conf
+    except Exception as e:
+        logger.debug("Quick tesseract failed page %d: %s", page_index, e)
+        quick_text, quick_conf = "", 0.0
+
+    # handwriting detection
+    try:
+        is_handwritten = _detect_handwritten(img_bgr)
+    except Exception as e:
+        logger.debug("Handwriting detect failed: %s", e)
+        is_handwritten = False
+
+    # if handwriting and EasyOCR available, try EasyOCR
+    if is_handwritten and _EASY_OCR_AVAILABLE:
+        try:
+            text, conf = _ocr_easyocr_on_bgr(img_bgr)
+            if text and conf >= 0.2:  # easyocr confidences are often smaller; accept lower threshold
+                logger.info("Page %d routed to EasyOCR (handwritten) conf=%.3f len=%d", page_index, conf, len(text))
+                return text, conf
+        except Exception as e:
+            logger.debug("EasyOCR on page %d failed: %s", page_index, e)
+
+    # Advanced multi-pass preprocessing & line-level OCR
+    best_text = quick_text or ""
+    best_conf = quick_conf or 0.0
+
+    preprocess_variants = [
+        (31, 15, 1.0),
+        (31, 12, 1.0),
+        (41, 18, 1.2),
+        (31, 15, 1.5),
+    ]
+
+    for (bs, cval, up) in preprocess_variants:
+        try:
+            bw = _preprocess_for_ocr(img_bgr, blocksize=bs, c_val=cval, upsample=up)
+            lines = _segment_lines_from_bw(bw)
+            line_texts = []
+            confs = []
+            for (y1, y2) in lines:
+                line_crop = img_bgr[y1:y2, :]
+                # best-of configs for line
+                line_bw = _preprocess_for_ocr(line_crop, blocksize=bs, c_val=cval, upsample=up)
+                t, conf = _ocr_tesseract_with_fallbacks(line_bw)
+                if t:
+                    line_texts.append(t)
+                    confs.append(conf)
+            page_text = "\n".join([lt for lt in line_texts if lt])
+            page_conf = (sum(confs) / len(confs)) if confs else 0.0
+            if page_text and (page_conf > best_conf or len(page_text) > len(best_text)):
+                best_text = page_text
+                best_conf = page_conf
+                logger.debug("Variant bs=%d c=%d up=%.2f improved page %d conf=%.3f len=%d", bs, cval, up, page_index, page_conf, len(page_text))
+            # if sufficiently good, break early
+            if best_conf >= OCR_ACCEPT_CONF:
+                break
+        except Exception as e:
+            logger.debug("Advanced pass failed bs=%d c=%d up=%.2f: %s", bs, cval, up, e)
+            continue
+
+    # As last resort, try EasyOCR on whole page if available and we still have very low confidence
+    if not best_text and _EASY_OCR_AVAILABLE:
+        try:
+            text, conf = _ocr_easyocr_on_bgr(img_bgr)
+            if text:
+                logger.info("Page %d EasyOCR fallback conf=%.3f len=%d", page_index, conf, len(text))
+                return text, conf
+        except Exception:
+            pass
+
+    return _clean_text(best_text), float(best_conf)
+
+# ---------- High-level API ----------
+
+async def extract_text_from_pdf(file: UploadFile) -> str:
+    """
+    Process PDF pages in parallel with early-accept, handwriting routing,
+    multi-pass preprocessing, and conservative corpus postprocessing.
+    """
+    content = await file.read()
+
+    temp_dir = tempfile.gettempdir()
+    tmp_pdf_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.pdf")
+    try:
+        with open(tmp_pdf_path, "wb") as f:
+            f.write(content)
+
+        images_to_process = []  # (page_index (1-based), pil_image) for pages that need OCR
+        direct_texts = {}  # page_index -> direct selectable text
+
+        with pdfplumber.open(tmp_pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            for idx, page in enumerate(pdf.pages, start=1):
+                direct_text = (page.extract_text() or "").strip()
+                if direct_text:
+                    direct_texts[idx] = _clean_text(direct_text)
+                else:
+                    try:
+                        pil_img = page.to_image(resolution=300).original
+                        bgr = _pil_to_bgr(pil_img)
+                        images_to_process.append((idx, bgr))
+                    except Exception as e:
+                        logger.debug("Page render failed idx=%d: %s", idx, e)
+                        images_to_process.append((idx, np.zeros((100, 100, 3), dtype=np.uint8)))
+
+        # Process images in parallel
+        results = {}  # page_index -> (text, conf)
+        if images_to_process:
+            with ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS) as ex:
+                futures = {ex.submit(_process_image_page, img, idx): idx for (idx, img) in images_to_process}
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    try:
+                        text, conf = fut.result()
+                        results[idx] = (text, conf)
+                    except Exception as e:
+                        logger.exception("Page processing failed idx=%d: %s", idx, e)
+                        results[idx] = ("", 0.0)
+
+        # Assemble pages in order
+        page_texts = []
+        for idx in range(1, total_pages + 1):
+            if idx in direct_texts:
+                page_texts.append(direct_texts[idx])
+            else:
+                t, _ = results.get(idx, ("", 0.0))
+                if t:
+                    page_texts.append(t)
+
+        raw = _clean_text("\n\n".join([p for p in page_texts if p]))
+        # Postprocess with external corpus (conservative)
+        corrected, changes = postprocess_with_corpus(raw)
+        if changes:
+            logger.info("extract_text_from_pdf: corpus corrections=%d", changes)
+        return corrected
+    finally:
+        try:
+            if os.path.exists(tmp_pdf_path):
+                os.remove(tmp_pdf_path)
+        except Exception:
+            pass
+
+async def extract_text_from_image(file: UploadFile) -> str:
+    """
+    Process single image with same pipeline used for pages.
+    """
+    content = await file.read()
+    arr = np.frombuffer(content, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return ""
+
+    text, conf = _process_image_page(img, 1)
+    corrected, changes = postprocess_with_corpus(text)
+    if changes:
+        logger.info("extract_text_from_image: corpus corrections=%d", changes)
+    return corrected

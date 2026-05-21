@@ -1,138 +1,283 @@
 from sentence_transformers import SentenceTransformer, util
 from app.utils.text_cleaner import tokenize, clean_text
+
 import hashlib
+import re
+
 from typing import Dict, Optional, Any
+
+
+# =========================================================
+# MODEL
+# =========================================================
 
 _model = SentenceTransformer("all-MiniLM-L6-v2")
 
 
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
 def _safe_text(x: str) -> str:
+
     return clean_text(x or "")
 
 
 def _token_set(x: str) -> set:
+
     return set(tokenize(_safe_text(x)))
 
 
-def _ngrams(tokens: list, n: int) -> set:
-    if len(tokens) < n:
-        return set()
-    return set(tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1))
-
-
 def _emb_key(text: str) -> str:
-    # request-scope key; deterministic in one run
-    return hashlib.sha256(_safe_text(text).encode("utf-8")).hexdigest()
+
+    return hashlib.sha256(
+        _safe_text(text).encode("utf-8")
+    ).hexdigest()
 
 
-def keyword_score(model_ans: str, student_ans: str) -> float:
-    m_clean = _safe_text(model_ans)
-    s_clean = _safe_text(student_ans)
-
-    m_tokens = tokenize(m_clean)
-    s_tokens = tokenize(s_clean)
-
-    if not m_tokens:
-        return 0.0
-
-    m_uni = set(m_tokens)
-    s_uni = set(s_tokens)
-
-    uni_overlap = len(m_uni & s_uni) / max(1, len(m_uni))
-
-    m_bi = _ngrams(m_tokens, 2)
-    s_bi = _ngrams(s_tokens, 2)
-    if m_bi:
-        bi_overlap = len(m_bi & s_bi) / len(m_bi)
-        score = 0.7 * uni_overlap + 0.3 * bi_overlap
-    else:
-        score = uni_overlap
-
-    return max(0.0, min(1.0, score))
-
+# =========================================================
+# SEMANTIC SCORE
+# =========================================================
 
 def semantic_score(
     model_ans: str,
     student_ans: str,
     embedding_cache: Optional[Dict[str, Any]] = None,
 ) -> float:
+
     a = _safe_text(model_ans)
     b = _safe_text(student_ans)
+
     if not a or not b:
         return 0.0
 
-    embedding_cache = embedding_cache if embedding_cache is not None else {}
+    embedding_cache = (
+        embedding_cache
+        if embedding_cache is not None
+        else {}
+    )
 
     key_a = f"model::{_emb_key(a)}"
     key_b = f"student::{_emb_key(b)}"
 
-    # Cache hits inside single evaluation cycle
     emb_a = embedding_cache.get(key_a)
+
     if emb_a is None:
-        emb_a = _model.encode(a, convert_to_tensor=True, normalize_embeddings=True)
+
+        emb_a = _model.encode(
+            a,
+            convert_to_tensor=True,
+            normalize_embeddings=True
+        )
+
         embedding_cache[key_a] = emb_a
 
     emb_b = embedding_cache.get(key_b)
+
     if emb_b is None:
-        emb_b = _model.encode(b, convert_to_tensor=True, normalize_embeddings=True)
+
+        emb_b = _model.encode(
+            b,
+            convert_to_tensor=True,
+            normalize_embeddings=True
+        )
+
         embedding_cache[key_b] = emb_b
 
-    sim = util.cos_sim(emb_a, emb_b).item()  # [-1, 1]
+    sim = util.cos_sim(emb_a, emb_b).item()
+
     normalized = (sim + 1.0) / 2.0
+
     return max(0.0, min(1.0, normalized))
 
 
-def _length_quality_factor(model_ans: str, student_ans: str) -> float:
-    m_len = len(tokenize(_safe_text(model_ans)))
-    s_len = len(tokenize(_safe_text(student_ans)))
+# =========================================================
+# KEYWORD SCORE
+# =========================================================
+
+def keyword_score(
+    model_ans: str,
+    student_ans: str
+) -> float:
+
+    model_tokens = _token_set(model_ans)
+    student_tokens = _token_set(student_ans)
+
+    if not model_tokens:
+        return 0.0
+
+    overlap = model_tokens & student_tokens
+
+    score = (
+        len(overlap)
+        / len(model_tokens)
+    )
+
+    return max(0.0, min(1.0, score))
+
+
+# =========================================================
+# TOKEN LENGTH FACTOR
+# =========================================================
+
+def token_length_factor(
+    model_ans: str,
+    student_ans: str
+) -> float:
+
+    model_tokens = tokenize(
+        _safe_text(model_ans)
+    )
+
+    student_tokens = tokenize(
+        _safe_text(student_ans)
+    )
+
+    m_len = len(model_tokens)
+    s_len = len(student_tokens)
 
     if m_len == 0:
-        return 0.0
+        return 1.0
+
     ratio = s_len / m_len
 
-    if ratio >= 0.85:
-        return 1.0
-    if ratio >= 0.55:
-        return 0.92
-    if ratio >= 0.35:
-        return 0.82
-    if ratio >= 0.20:
-        return 0.70
-    return 0.55
+    # -------------------------------------
+    # TOKEN RATIO BASED SCORING
+    # -------------------------------------
 
+    if ratio >= 1.0:
+        return 1.0
+
+    if ratio >= 0.8:
+        return 0.95
+
+    if ratio >= 0.6:
+        return 0.85
+
+    if ratio >= 0.4:
+        return 0.70
+
+    if ratio >= 0.25:
+        return 0.55
+
+    return 0.35
+
+
+# =========================================================
+# MAIN EVALUATION
+# =========================================================
 
 def evaluate_answer(
     model_ans: str,
     student_ans: str,
     max_marks: float,
-    embedding_cache: Optional[Dict[str, Any]] = None,  # NEW
+    embedding_cache: Optional[Dict[str, Any]] = None,
 ) -> dict:
-    k = keyword_score(model_ans, student_ans)
-    s = semantic_score(model_ans, student_ans, embedding_cache=embedding_cache)
 
-    m_tokens = tokenize(_safe_text(model_ans))
-    if len(m_tokens) <= 25:
-        wk, ws = 0.45, 0.55
+    model_ans = _safe_text(model_ans)
+    student_ans = _safe_text(student_ans)
+
+    # =====================================================
+    # EMPTY ANSWER
+    # =====================================================
+
+    if not student_ans.strip():
+
+        return {
+            "keyword_score": 0.0,
+            "semantic_score": 0.0,
+            "token_factor": 0.0,
+            "final_score": 0.0,
+            "awarded_marks": 0.0,
+            "feedback": "No answer provided"
+        }
+
+    # =====================================================
+    # SEMANTIC SCORE (70%)
+    # =====================================================
+
+    semantic = semantic_score(
+        model_ans,
+        student_ans,
+        embedding_cache=embedding_cache
+    )
+
+    # =====================================================
+    # KEYWORD SCORE (30%)
+    # =====================================================
+
+    keyword = keyword_score(
+        model_ans,
+        student_ans
+    )
+
+    # =====================================================
+    # BASE SCORE
+    # =====================================================
+
+    base_score = (
+        (semantic * 0.70) +
+        (keyword * 0.30)
+    )
+
+    # =====================================================
+    # TOKEN FACTOR
+    # =====================================================
+
+    token_factor = token_length_factor(
+        model_ans,
+        student_ans
+    )
+
+    # =====================================================
+    # FINAL SCORE
+    # =====================================================
+
+    final_score = (
+        base_score *
+        token_factor
+    )
+
+    final_score = max(
+        0.0,
+        min(1.0, final_score)
+    )
+
+    awarded_marks = round(
+        final_score * float(max_marks),
+        2
+    )
+
+    # =====================================================
+    # FEEDBACK
+    # =====================================================
+
+    if final_score >= 0.80:
+        feedback = "Excellent answer"
+
+    elif final_score >= 0.65:
+        feedback = "Good answer"
+
+    elif final_score >= 0.45:
+        feedback = "Partially correct"
+
+    elif final_score >= 0.25:
+        feedback = "Needs improvement"
+
     else:
-        wk, ws = 0.30, 0.70
-
-    base = wk * k + ws * s
-
-    lqf = _length_quality_factor(model_ans, student_ans)
-    final = max(0.0, min(1.0, base * lqf))
-
-    awarded = round(final * float(max_marks), 2)
-
-    if final >= 0.78:
-        fb = "Good answer"
-    elif final >= 0.50:
-        fb = "Partially correct"
-    else:
-        fb = "Needs improvement"
+        feedback = "Incorrect answer"
 
     return {
-        "keyword_score": round(k, 3),
-        "semantic_score": round(s, 3),
-        "awarded_marks": awarded,
-        "feedback": fb
+
+        "keyword_score": round(keyword, 3),
+
+        "semantic_score": round(semantic, 3),
+
+        "token_factor": round(token_factor, 3),
+
+        "final_score": round(final_score, 3),
+
+        "awarded_marks": awarded_marks,
+
+        "feedback": feedback
     }

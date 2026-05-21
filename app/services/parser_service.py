@@ -1,137 +1,315 @@
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 ROMAN_MAP = {
     "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5,
     "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10,
-    "xi": 11, "xii": 12, "xiii": 13, "xiv": 14, "xv": 15,
-    "xvi": 16, "xvii": 17, "xviii": 18, "xix": 19, "xx": 20
+    "xi": 11, "xii": 12, "xiii": 13, "xiv": 14,
+    "xv": 15, "xvi": 16, "xvii": 17,
+    "xviii": 18, "xix": 19, "xx": 20
 }
 
-def _normalize_ocr_noise(text: str) -> str:
+
+# =========================================================
+# OCR CLEANING
+# =========================================================
+
+def _normalize(text: str) -> str:
+
     if not text:
         return ""
-    t = text.replace("\r", "\n")
-    t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
 
-    # Common OCR misreads
-    t = re.sub(r"\bquestlon\b", "question", t, flags=re.IGNORECASE)
-    t = re.sub(r"\banswेर\b", "answer", t, flags=re.IGNORECASE)
-    t = re.sub(r"\bq[\|lI]\b", "q1", t, flags=re.IGNORECASE)  # ql/qI -> q1
+    text = text.replace("\r", "\n")
 
-    return t.strip()
+    text = re.sub(r"[ \t]+", " ", text)
 
-def _roman_to_int(token: str) -> int | None:
-    return ROMAN_MAP.get(token.strip().lower())
+    text = re.sub(r"\n{3,}", "\n\n", text)
 
-def _to_qno(num_token: str | None, roman_token: str | None) -> int | None:
-    if num_token and num_token.isdigit():
-        return int(num_token)
-    if roman_token:
-        return _roman_to_int(roman_token)
-    return None
-
-def _merge_duplicate_blocks(blocks: List[Tuple[int, str]]) -> Dict[int, str]:
-    out: Dict[int, str] = {}
-    for q_no, txt in blocks:
-        txt = txt.strip()
-        if not txt:
-            continue
-        if q_no in out:
-            out[q_no] = (out[q_no] + "\n" + txt).strip()
-        else:
-            out[q_no] = txt
-    return out
-
-def _fallback_split(text: str, expected_q_count: int = 0) -> Dict[int, str]:
-    chunks = [c.strip() for c in re.split(r"\n\s*\n+", text) if c.strip()]
-    if not chunks:
-        return {1: text.strip()} if text.strip() else {}
-    if expected_q_count > 0 and len(chunks) >= expected_q_count:
-        chunks = chunks[:expected_q_count]
-    return {i + 1: c for i, c in enumerate(chunks)}
-
-def split_answers_by_question(text: str, expected_q_count: int = 0) -> Dict[int, str]:
-    """
-    Supports:
-    - Q1, Q.1, Question 1
-    - Ans 1, Ans.1, Answer 1, Answer:1, A1, A.1
-    - 1), 1., 1:, (1)
-    - plain line: "1" (just number on a line)
-    - roman numerals for prefixed forms
-    """
-    raw = _normalize_ocr_noise(text)
-    if not raw:
-        return {}
-
-    pattern = re.compile(
-        r"""
-        (?:(?<=^)|(?<=\n))\s*
-        (?:
-            # Q / Question / Ans / Answer / A prefix
-            (?:
-                q(?:uestion)?|
-                ans(?:wer)?|
-                a
-            )\s*[\.\-:)]?\s*
-            (?:
-                (?P<num1>\d{1,3})|
-                (?P<rom1>[ivxlcdm]{1,8})
-            )\b
-
-            |
-
-            # Numbered header like 1)  1.  1:  (1)
-            [\(\[]?\s*
-            (?:
-                (?P<num2>\d{1,3})|
-                (?P<rom2>[ivxlcdm]{1,8})
-            )\s*[\)\].:\-]
-
-            |
-
-            # Plain line number header: "1" (only number on line)
-            (?P<num3>\d{1,3})\s*(?=\n|$)
-        )
-        """,
-        re.IGNORECASE | re.VERBOSE,
+    text = re.sub(
+        r"\bquestlon\b",
+        "question",
+        text,
+        flags=re.IGNORECASE
     )
 
-    matches = list(pattern.finditer(raw))
-    if not matches:
-        return _fallback_split(raw, expected_q_count)
+    text = re.sub(
+        r"\banswेर\b",
+        "answer",
+        text,
+        flags=re.IGNORECASE
+    )
 
-    blocks: List[Tuple[int, str]] = []
-    for i, m in enumerate(matches):
-        q_no = _to_qno(
-            m.group("num1") or m.group("num2") or m.group("num3"),
-            m.group("rom1") or m.group("rom2"),
+    return text.strip()
+
+
+# =========================================================
+# ROMAN
+# =========================================================
+
+def _roman_to_int(token: str) -> Optional[int]:
+
+    return ROMAN_MAP.get(
+        token.lower().strip()
+    )
+
+
+# =========================================================
+# VALIDATION
+# =========================================================
+
+def _is_valid_answer(text: str) -> bool:
+
+    if not text:
+        return False
+
+    cleaned = re.sub(
+        r"[^a-zA-Z0-9]",
+        "",
+        text
+    )
+
+    return len(cleaned) >= 2
+
+
+# =========================================================
+# HEADER PATTERNS
+# =========================================================
+
+# STRICT student parser
+STUDENT_HEADER_PATTERN = re.compile(
+    r"""
+    (?im)
+
+    ^\s*
+
+    (?:
+        (?:
+            q(?:uestion)? |
+            ans(?:wer)? |
+            a
+        )?
+
+        \s*
+        [\.\-:)]?
+        \s*
+
+        (?:
+            (?P<num>\d{1,3}) |
+            (?P<roman>[ivxlcdm]{1,8})
         )
-        if q_no is None:
+
+        \s*
+        [\)\].:\-]?
+    )
+
+    \s*$
+    """,
+    re.VERBOSE
+)
+
+# PERMISSIVE teacher parser
+TEACHER_HEADER_PATTERN = re.compile(
+    r"""
+    (?im)
+
+    ^\s*
+
+    (?:
+        (?:
+            q(?:uestion)? |
+            ans(?:wer)? |
+            a
+        )?
+
+        \s*
+        [\.\-:]?
+        \s*
+
+        (?:
+            (?P<num>\d{1,3}) |
+            (?P<roman>[ivxlcdm]{1,8})
+        )
+
+        \s*
+        [\)\].:\-]?
+    )
+    """,
+    re.VERBOSE
+)
+
+
+# =========================================================
+# FIND HEADERS
+# =========================================================
+
+def _find_headers(
+    text: str,
+    expected_set: set,
+    teacher_mode: bool = False
+) -> List[Tuple[int, int, int, str]]:
+
+    headers = []
+
+    current_pos = 0
+
+    lines = text.split("\n")
+
+    pattern = (
+        TEACHER_HEADER_PATTERN
+        if teacher_mode
+        else STUDENT_HEADER_PATTERN
+    )
+
+    for line in lines:
+
+        stripped = line.strip()
+
+        match = pattern.match(stripped)
+
+        if match:
+
+            num = match.group("num")
+            roman = match.group("roman")
+
+            q_no = None
+
+            if num:
+                q_no = int(num)
+
+            elif roman:
+                q_no = _roman_to_int(roman)
+
+            if q_no and (
+                not expected_set or
+                q_no in expected_set
+            ):
+
+                start = current_pos
+                end = current_pos + len(line)
+
+                headers.append(
+                    (
+                        q_no,
+                        start,
+                        end,
+                        line
+                    )
+                )
+
+        current_pos += len(line) + 1
+
+    return headers
+
+
+# =========================================================
+# CLEAN ANSWER
+# =========================================================
+
+def _clean_answer(answer: str) -> str:
+
+    if not answer:
+        return ""
+
+    answer = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        answer
+    )
+
+    return answer.strip()
+
+
+# =========================================================
+# MAIN PARSER
+# =========================================================
+
+def split_answers_by_question(
+    text: str,
+    expected_qnos: Optional[List[int]] = None,
+    teacher_mode: bool = False
+) -> Dict[int, str]:
+
+    text = _normalize(text)
+
+    if not text:
+        return {}
+
+    expected_set = set(expected_qnos or [])
+
+    headers = _find_headers(
+        text,
+        expected_set,
+        teacher_mode=teacher_mode
+    )
+
+    if not headers:
+        return {}
+
+    parsed: Dict[int, str] = {}
+
+    pattern = (
+        TEACHER_HEADER_PATTERN
+        if teacher_mode
+        else STUDENT_HEADER_PATTERN
+    )
+
+    for i, (
+        q_no,
+        start,
+        end,
+        full_line
+    ) in enumerate(headers):
+
+        # ============================================
+        # SAME LINE ANSWER SUPPORT
+        # ============================================
+
+        same_line_answer = ""
+
+        if teacher_mode:
+
+            header_match = pattern.match(
+                full_line.strip()
+            )
+
+            if header_match:
+
+                same_line_answer = full_line[
+                    header_match.end():
+                ].strip()
+
+        # ============================================
+        # NORMAL ANSWER EXTRACTION
+        # ============================================
+
+        answer_start = end
+
+        if i + 1 < len(headers):
+            answer_end = headers[i + 1][1]
+        else:
+            answer_end = len(text)
+
+        answer = text[
+            answer_start:answer_end
+        ].strip()
+
+        # merge same-line answer
+        if same_line_answer:
+
+            if answer:
+                answer = (
+                    same_line_answer
+                    + "\n" +
+                    answer
+                )
+            else:
+                answer = same_line_answer
+
+        answer = _clean_answer(answer)
+
+        if not _is_valid_answer(answer):
             continue
 
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
-        ans = raw[start:end].strip()
+        parsed[q_no] = answer
 
-        if len(ans) < 1:
-            continue
-
-        blocks.append((q_no, ans))
-
-    if not blocks:
-        return _fallback_split(raw, expected_q_count)
-
-    out = _merge_duplicate_blocks(blocks)
-
-    if expected_q_count > 0:
-        out = {k: out[k] for k in sorted(out) if 1 <= k <= expected_q_count}
-
-        # If too weak parse, fallback sometimes better
-        if len(out) <= 1 and expected_q_count > 1:
-            fb = _fallback_split(raw, expected_q_count)
-            if len(fb) > len(out):
-                return fb
-
-    return out
+    return dict(sorted(parsed.items()))

@@ -12,7 +12,7 @@ app = FastAPI(title="AutoGrade Backend", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://autograde.toshankanwar.in"],
+    allow_origins=["http://localhost:3001","https://autograde.toshankanwar.in"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
