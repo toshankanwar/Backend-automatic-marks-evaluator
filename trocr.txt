@@ -1,0 +1,672 @@
+import os
+import re
+import uuid
+import time
+import logging
+import tempfile
+
+import cv2
+import numpy as np
+import pytesseract
+import torch
+import pdfplumber
+
+from PIL import Image
+
+from pdf2image import convert_from_path
+
+from transformers import (
+    TrOCRProcessor,
+    VisionEncoderDecoderModel
+)
+
+from fastapi import UploadFile
+
+
+# =========================================================
+# LOGGER CONFIG
+# =========================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("OCR_SERVICE")
+
+
+# =========================================================
+# WINDOWS POPPLER PATH
+# =========================================================
+
+POPPLER_PATH = r"C:\poppler-25.12.0\Library\bin"
+
+# Example:
+# C:\poppler\Library\bin\pdftoppm.exe
+
+
+# =========================================================
+# DEVICE
+# =========================================================
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+logger.info(f"Using device: {DEVICE}")
+
+
+# =========================================================
+# GLOBAL MODELS
+# =========================================================
+
+trocr_processor = None
+trocr_model = None
+
+
+# =========================================================
+# LOAD TrOCR
+# =========================================================
+
+def get_trocr():
+
+    global trocr_processor
+    global trocr_model
+
+    if trocr_processor is not None and trocr_model is not None:
+        return trocr_processor, trocr_model
+
+    try:
+
+        logger.info("Loading TrOCR model...")
+
+        trocr_processor = TrOCRProcessor.from_pretrained(
+            "microsoft/trocr-base-handwritten"
+        )
+
+        trocr_model = VisionEncoderDecoderModel.from_pretrained(
+            "microsoft/trocr-base-handwritten"
+        )
+
+        trocr_model.to(DEVICE)
+
+        logger.info("TrOCR loaded successfully")
+
+    except Exception as e:
+
+        logger.error(f"TrOCR loading failed: {e}")
+
+        trocr_processor = None
+        trocr_model = None
+
+    return trocr_processor, trocr_model
+
+
+# =========================================================
+# CLEAN TEXT
+# =========================================================
+
+def _clean_text(text):
+
+    if not text:
+        return ""
+
+    text = text.replace("\r", "\n")
+
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text
+    )
+
+    return text.strip()
+
+
+# =========================================================
+# CHECK OCR REQUIRED
+# =========================================================
+
+def _should_use_ocr(page):
+
+    """
+    Detect scanned PDFs.
+
+    Many scanned PDFs contain hidden OCR text.
+    """
+
+    try:
+
+        images = page.images
+
+        extracted_text = (
+            page.extract_text() or ""
+        ).strip()
+
+        logger.info(
+            f"Extracted chars={len(extracted_text)} "
+            f"images={len(images)}"
+        )
+
+        # If images exist
+        if len(images) > 0:
+
+            logger.info(
+                "Scanned PDF detected via images"
+            )
+
+            return True
+
+        # Low text count
+        if len(extracted_text) < 100:
+
+            logger.info(
+                "Too little text -> OCR needed"
+            )
+
+            return True
+
+        # Garbage OCR text
+        garbage_ratio = len(
+            re.findall(
+                r"[^a-zA-Z0-9\s.,;:!?()\-]",
+                extracted_text
+            )
+        ) / max(len(extracted_text), 1)
+
+        logger.info(
+            f"Garbage ratio={round(garbage_ratio,3)}"
+        )
+
+        if garbage_ratio > 0.15:
+
+            logger.info(
+                "Garbage OCR text detected"
+            )
+
+            return True
+
+        return False
+
+    except Exception as e:
+
+        logger.warning(
+            f"PDF detection failed: {e}"
+        )
+
+        return True
+
+
+# =========================================================
+# DESKEW
+# =========================================================
+
+def _deskew(image):
+
+    try:
+
+        gray = cv2.cvtColor(
+            image,
+            cv2.COLOR_BGR2GRAY
+        )
+
+        thresh = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )[1]
+
+        coords = np.column_stack(
+            np.where(thresh > 0)
+        )
+
+        if len(coords) == 0:
+            return image
+
+        angle = cv2.minAreaRect(coords)[-1]
+
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+
+        h, w = image.shape[:2]
+
+        center = (w // 2, h // 2)
+
+        matrix = cv2.getRotationMatrix2D(
+            center,
+            angle,
+            1.0
+        )
+
+        rotated = cv2.warpAffine(
+            image,
+            matrix,
+            (w, h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE
+        )
+
+        logger.info(
+            f"Deskew angle={round(angle,2)}"
+        )
+
+        return rotated
+
+    except Exception as e:
+
+        logger.warning(
+            f"Deskew failed: {e}"
+        )
+
+        return image
+
+
+# =========================================================
+# UPSCALE
+# =========================================================
+
+def _upscale(image):
+
+    h, w = image.shape[:2]
+
+    if max(h, w) < 2000:
+
+        image = cv2.resize(
+            image,
+            None,
+            fx=2,
+            fy=2,
+            interpolation=cv2.INTER_CUBIC
+        )
+
+        logger.info("Image upscaled 2x")
+
+    return image
+
+
+# =========================================================
+# SHARPEN
+# =========================================================
+
+def _sharpen(image):
+
+    kernel = np.array([
+        [0, -1, 0],
+        [-1, 5, -1],
+        [0, -1, 0]
+    ])
+
+    return cv2.filter2D(
+        image,
+        -1,
+        kernel
+    )
+
+
+# =========================================================
+# PREPROCESS
+# =========================================================
+
+def _preprocess(image):
+
+    image = _deskew(image)
+
+    image = _upscale(image)
+
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    # Denoise
+    gray = cv2.fastNlMeansDenoising(
+        gray,
+        None,
+        10,
+        7,
+        21
+    )
+
+    # CLAHE
+    clahe = cv2.createCLAHE(
+        clipLimit=2.5,
+        tileGridSize=(8, 8)
+    )
+
+    gray = clahe.apply(gray)
+
+    # Sharpen
+    gray = _sharpen(gray)
+
+    # Adaptive Threshold
+    thresh = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        15
+    )
+
+    return thresh
+
+
+# =========================================================
+# TrOCR
+# =========================================================
+
+def _ocr_trocr(image):
+
+    processor, model = get_trocr()
+
+    if processor is None or model is None:
+
+        logger.error("TrOCR unavailable")
+
+        return ""
+
+    try:
+
+        logger.info("Running TrOCR...")
+
+        start = time.time()
+
+        rgb = cv2.cvtColor(
+            image,
+            cv2.COLOR_BGR2RGB
+        )
+
+        pil_image = Image.fromarray(rgb)
+
+        pixel_values = processor(
+            images=pil_image,
+            return_tensors="pt"
+        ).pixel_values
+
+        pixel_values = pixel_values.to(DEVICE)
+
+        generated_ids = model.generate(
+            pixel_values,
+            max_length=512
+        )
+
+        text = processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True
+        )[0]
+
+        text = _clean_text(text)
+
+        logger.info(
+            f"TrOCR chars={len(text)} "
+            f"time={round(time.time()-start,2)}s"
+        )
+
+        return text
+
+    except Exception as e:
+
+        logger.error(
+            f"TrOCR failed: {e}"
+        )
+
+        return ""
+
+
+# =========================================================
+# TESSERACT FALLBACK
+# =========================================================
+
+def _ocr_tesseract(image):
+
+    logger.info(
+        "Running Tesseract fallback"
+    )
+
+    configs = [
+        "--oem 3 --psm 6",
+        "--oem 3 --psm 4",
+        "--oem 3 --psm 11"
+    ]
+
+    best_text = ""
+
+    for cfg in configs:
+
+        try:
+
+            text = pytesseract.image_to_string(
+                image,
+                config=cfg
+            )
+
+            text = _clean_text(text)
+
+            logger.info(
+                f"Tesseract cfg={cfg} "
+                f"chars={len(text)}"
+            )
+
+            if len(text) > len(best_text):
+                best_text = text
+
+        except Exception as e:
+
+            logger.warning(
+                f"Tesseract failed: {e}"
+            )
+
+    logger.info(
+        f"Tesseract best chars={len(best_text)}"
+    )
+
+    return best_text
+
+
+# =========================================================
+# HYBRID OCR
+# =========================================================
+
+def _hybrid_ocr(image):
+
+    logger.info(
+        "Starting OCR pipeline"
+    )
+
+    processed = _preprocess(image)
+
+    trocr_text = _ocr_trocr(processed)
+
+    tess_text = _ocr_tesseract(processed)
+
+    logger.info(
+        f"TrOCR chars={len(trocr_text)} "
+        f"Tesseract chars={len(tess_text)}"
+    )
+
+    # Choose best output
+    if len(trocr_text) >= len(tess_text):
+
+        logger.info(
+            "Selected TrOCR output"
+        )
+
+        final = trocr_text
+
+    else:
+
+        logger.info(
+            "Selected Tesseract output"
+        )
+
+        final = tess_text
+
+    return _clean_text(final)
+
+
+# =========================================================
+# PDF OCR
+# =========================================================
+
+async def extract_text_from_pdf(
+    file: UploadFile
+):
+
+    logger.info(
+        f"PDF Processing: {file.filename}"
+    )
+
+    content = await file.read()
+
+    temp_dir = tempfile.gettempdir()
+
+    tmp_pdf = os.path.join(
+        temp_dir,
+        f"{uuid.uuid4().hex}.pdf"
+    )
+
+    text_parts = []
+
+    try:
+
+        with open(tmp_pdf, "wb") as f:
+            f.write(content)
+
+        # =========================================
+        # OPEN PDF
+        # =========================================
+
+        with pdfplumber.open(tmp_pdf) as pdf:
+
+            logger.info(
+                f"PDF Pages={len(pdf.pages)}"
+            )
+
+            # =====================================
+            # CONVERT ALL PDF PAGES TO IMAGES
+            # =====================================
+
+            pdf_images = convert_from_path(
+                tmp_pdf,
+                dpi=400,
+                poppler_path=POPPLER_PATH
+            )
+
+            for idx, page in enumerate(pdf.pages):
+
+                logger.info(
+                    f"Processing Page {idx+1}"
+                )
+
+                use_ocr = _should_use_ocr(page)
+
+                # =================================
+                # DIRECT TEXT EXTRACTION
+                # =================================
+
+                if not use_ocr:
+
+                    logger.info(
+                        "Using direct extraction"
+                    )
+
+                    text = page.extract_text() or ""
+
+                    text_parts.append(
+                        _clean_text(text)
+                    )
+
+                    continue
+
+                # =================================
+                # OCR
+                # =================================
+
+                logger.info(
+                    "Using OCR for scanned page"
+                )
+
+                pil_img = pdf_images[idx]
+
+                image = cv2.cvtColor(
+                    np.array(pil_img),
+                    cv2.COLOR_RGB2BGR
+                )
+
+                text = _hybrid_ocr(image)
+
+                text_parts.append(text)
+
+        final = "\n\n".join([
+            x for x in text_parts
+            if x.strip()
+        ])
+
+        logger.info(
+            f"PDF OCR Completed "
+            f"chars={len(final)}"
+        )
+
+        return _clean_text(final)
+
+    finally:
+
+        if os.path.exists(tmp_pdf):
+
+            os.remove(tmp_pdf)
+
+            logger.info(
+                "Temporary PDF removed"
+            )
+
+
+# =========================================================
+# IMAGE OCR
+# =========================================================
+
+async def extract_text_from_image(
+    file: UploadFile
+):
+
+    logger.info(
+        f"Image Processing: {file.filename}"
+    )
+
+    content = await file.read()
+
+    arr = np.frombuffer(
+        content,
+        np.uint8
+    )
+
+    image = cv2.imdecode(
+        arr,
+        cv2.IMREAD_COLOR
+    )
+
+    if image is None:
+
+        logger.error(
+            "Image decode failed"
+        )
+
+        return ""
+
+    logger.info(
+        f"Image shape={image.shape}"
+    )
+
+    text = _hybrid_ocr(image)
+
+    logger.info(
+        f"Image OCR Completed "
+        f"chars={len(text)}"
+    )
+
+    return _clean_text(text)
